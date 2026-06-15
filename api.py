@@ -1,8 +1,10 @@
+import os
 from datetime import datetime, timezone
 from typing import Annotated, Literal
 from uuid import uuid4
 
 from fastapi import Depends, FastAPI, HTTPException, Path, Query
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, EmailStr, Field
 
@@ -16,6 +18,20 @@ app = FastAPI(
         {"name": "좌석", "description": "공연별 좌석 조회"},
         {"name": "예매", "description": "예매 생성 및 조회 (인증 필요)"},
     ],
+)
+
+cors_origins = [
+    origin.strip()
+    for origin in os.getenv("CORS_ALLOW_ORIGINS", "*").split(",")
+    if origin.strip()
+]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=cors_origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 security = HTTPBearer(auto_error=False)
@@ -175,6 +191,11 @@ def _find_concert(concert_id: str) -> dict:
 
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+@app.get("/health", tags=["system"])
+def health():
+    return {"status": "ok"}
 
 
 # --- 인증 API ---

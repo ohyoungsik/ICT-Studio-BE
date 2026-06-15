@@ -1,5 +1,7 @@
 ### ICT-Studio-BE
 
+FastAPI backend for ICT Studio ticketing.
+
 ```bash
 source .venv/bin/activate
 
@@ -14,3 +16,73 @@ pip install -r requirements.txt
 
 uvicorn api:app --reload
 ```
+
+## Health check
+
+```bash
+curl http://localhost:8000/health
+```
+
+Expected response:
+
+```json
+{"status":"ok"}
+```
+
+## Docker
+
+Build and run locally:
+
+```bash
+docker build -t ict-studio-be .
+
+docker run -d \
+  --name ict-studio-be \
+  -p 8000:8000 \
+  ict-studio-be
+
+curl http://localhost:8000/health
+docker logs ict-studio-be
+docker rm -f ict-studio-be
+```
+
+Pull and run the Docker Hub image:
+
+```bash
+docker pull ohyoungsik/ict-studio-be:latest
+
+docker run -d \
+  --name ict-studio-be \
+  -p 8000:8000 \
+  ohyoungsik/ict-studio-be:latest
+
+curl http://localhost:8000/health
+docker rm -f ict-studio-be
+```
+
+## CI/CD
+
+GitHub Actions builds and pushes these tags:
+
+```text
+ohyoungsik/ict-studio-be:latest
+ohyoungsik/ict-studio-be:<github-sha>
+```
+
+Required secrets:
+
+```text
+DOCKERHUB_USERNAME
+DOCKERHUB_TOKEN
+```
+
+Optional deployment secrets or variables:
+
+```text
+AWS_ACCESS_KEY_ID
+AWS_SECRET_ACCESS_KEY
+AWS_REGION
+ASG_NAME
+```
+
+If `ASG_NAME` is not set, the workflow only builds and pushes the Docker image. This keeps the backend pipeline usable while AWS ASG resources are not present.

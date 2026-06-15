@@ -4,10 +4,13 @@ on:
   push:
     branches:
       - main
+  workflow_dispatch:
 
 jobs:
   docker:
     runs-on: ubuntu-latest
+    env:
+      DEPLOY_ASG_NAME: ${{ vars.ASG_NAME || secrets.ASG_NAME }}
 
     steps:
       - name: Checkout
@@ -20,7 +23,50 @@ jobs:
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Build Image
-        run: docker build -t ohyoungsik/ict-studio-be:latest .
+        run: |
+          docker build \
+            -t ohyoungsik/ict-studio-be:latest \
+            -t ohyoungsik/ict-studio-be:${{ github.sha }} \
+            .
 
       - name: Push Image
-        run: docker push ohyoungsik/ict-studio-be:latest
+        run: |
+          docker push ohyoungsik/ict-studio-be:latest
+          docker push ohyoungsik/ict-studio-be:${{ github.sha }}
+
+      - name: Configure AWS Credentials
+        if: ${{ env.DEPLOY_ASG_NAME != '' }}
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ vars.AWS_REGION || secrets.AWS_REGION || 'ap-northeast-2' }}
+
+      - name: Resolve Auto Scaling Group
+        if: ${{ env.DEPLOY_ASG_NAME != '' }}
+        id: asg
+        env:
+          ASG_NAME: ${{ env.DEPLOY_ASG_NAME }}
+        run: |
+          set -euo pipefail
+          echo "asg_name=${ASG_NAME}" >> "$GITHUB_OUTPUT"
+
+      - name: Start ASG Instance Refresh
+        if: ${{ env.DEPLOY_ASG_NAME != '' }}
+        run: |
+          set -euo pipefail
+
+          IN_PROGRESS_REFRESH_ID="$(
+            aws autoscaling describe-instance-refreshes \
+              --auto-scaling-group-name "${{ steps.asg.outputs.asg_name }}" \
+              --query "InstanceRefreshes[?Status=='Pending' || Status=='InProgress' || Status=='Cancelling' || Status=='RollbackInProgress'].InstanceRefreshId | [0]" \
+              --output text
+          )"
+
+          if [ -n "${IN_PROGRESS_REFRESH_ID}" ] && [ "${IN_PROGRESS_REFRESH_ID}" != "None" ]; then
+            echo "Instance refresh ${IN_PROGRESS_REFRESH_ID} is already in progress. Skipping new refresh."
+            exit 0
+          fi
+
+          aws autoscaling start-instance-refresh \
+            --auto-scaling-group-name "${{ steps.asg.outputs.asg_name }}"
