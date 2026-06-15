@@ -13,16 +13,11 @@ jobs:
     runs-on: ubuntu-latest
     env:
       DEPLOY_ASG_NAME: ${{ vars.ASG_NAME || secrets.ASG_NAME }}
+      DEPLOY_AWS_REGION: ${{ vars.AWS_REGION || secrets.AWS_REGION || 'ap-northeast-2' }}
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
-      - name: Docker Hub Login
-        uses: docker/login-action@v3
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Build Image
         run: |
@@ -30,6 +25,12 @@ jobs:
             -t ohyoungsik/ict-studio-be:${{ github.event.inputs.image_tag }} \
             -t ohyoungsik/ict-studio-be:${{ github.sha }} \
             .
+
+      - name: Docker Hub Login
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Push Image
         run: |
@@ -42,25 +43,42 @@ jobs:
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ vars.AWS_REGION || secrets.AWS_REGION || 'ap-northeast-2' }}
+          aws-region: ${{ env.DEPLOY_AWS_REGION }}
 
       - name: Resolve Auto Scaling Group
         if: ${{ github.event.inputs.image_tag == 'latest' && env.DEPLOY_ASG_NAME != '' }}
         id: asg
         env:
           ASG_NAME: ${{ env.DEPLOY_ASG_NAME }}
+          AWS_REGION: ${{ env.DEPLOY_AWS_REGION }}
         run: |
           set -euo pipefail
+          RESOLVED_ASG_NAME="$(
+            aws autoscaling describe-auto-scaling-groups \
+              --auto-scaling-group-names "${ASG_NAME}" \
+              --region "${AWS_REGION}" \
+              --query "AutoScalingGroups[0].AutoScalingGroupName" \
+              --output text
+          )"
+
+          if [ -z "${RESOLVED_ASG_NAME}" ] || [ "${RESOLVED_ASG_NAME}" = "None" ]; then
+            echo "Auto Scaling Group '${ASG_NAME}' was not found in ${AWS_REGION}. Skipping instance refresh."
+            echo "deploy_enabled=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
           echo "asg_name=${ASG_NAME}" >> "$GITHUB_OUTPUT"
+          echo "deploy_enabled=true" >> "$GITHUB_OUTPUT"
 
       - name: Start ASG Instance Refresh
-        if: ${{ github.event.inputs.image_tag == 'latest' && env.DEPLOY_ASG_NAME != '' }}
+        if: ${{ github.event.inputs.image_tag == 'latest' && env.DEPLOY_ASG_NAME != '' && steps.asg.outputs.deploy_enabled == 'true' }}
         run: |
           set -euo pipefail
 
           IN_PROGRESS_REFRESH_ID="$(
             aws autoscaling describe-instance-refreshes \
               --auto-scaling-group-name "${{ steps.asg.outputs.asg_name }}" \
+              --region "${{ env.DEPLOY_AWS_REGION }}" \
               --query "InstanceRefreshes[?Status=='Pending' || Status=='InProgress' || Status=='Cancelling' || Status=='RollbackInProgress'].InstanceRefreshId | [0]" \
               --output text
           )"
@@ -71,4 +89,5 @@ jobs:
           fi
 
           aws autoscaling start-instance-refresh \
-            --auto-scaling-group-name "${{ steps.asg.outputs.asg_name }}"
+            --auto-scaling-group-name "${{ steps.asg.outputs.asg_name }}" \
+            --region "${{ env.DEPLOY_AWS_REGION }}"
