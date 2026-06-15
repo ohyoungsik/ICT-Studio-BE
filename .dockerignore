@@ -1,5 +1,11 @@
-.venv
-.git
 __pycache__
 *.pyc
+*.pyo
+*.pyd
 .env
+.venv
+venv
+.git
+.github
+.vscode
+.DS_Store
