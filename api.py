@@ -177,6 +177,12 @@ def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+@app.get("/health", tags=["시스템"], summary="ALB 헬스체크")
+@app.get("/api/health", tags=["시스템"], summary="애플리케이션 헬스체크")
+def health_check():
+    return {"status": "ok"}
+
+
 # --- 인증 API ---
 
 @app.post(
