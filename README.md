@@ -29,6 +29,49 @@ Expected response:
 {"status":"ok"}
 ```
 
+## Queue and reservation load-test APIs
+
+Redis is required for queue APIs.
+PostgreSQL is not required by the current backend implementation. The
+`/api/reservations` endpoint is a lightweight in-memory endpoint for load-test
+response simulation, so data is not persisted after the backend process restarts.
+
+```bash
+docker compose up --build
+```
+
+In AWS, the infra project starts Redis on the swarm manager and passes these
+values into the backend container through SSM-backed bootstrap scripts:
+
+```text
+REDIS_HOST
+REDIS_PORT
+REDIS_PASSWORD
+```
+
+Available endpoints:
+
+```text
+POST /api/queue/join
+GET  /api/queue/status/{concertId}/{userId}
+GET  /api/queue/length/{concertId}
+POST /api/reservations
+```
+
+Example queue request:
+
+```bash
+curl -X POST http://localhost:8000/api/queue/join \
+  -H "Content-Type: application/json" \
+  -d '{"concertId":1,"userId":"user-1"}'
+```
+
+Run the k6 queue load test:
+
+```bash
+k6 run -e BASE_URL=http://localhost:8000 k6/ticketing-load-test.js
+```
+
 ## Docker
 
 Build and run locally:

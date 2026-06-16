@@ -1,0 +1,22 @@
+services:
+  backend:
+    build: .
+    container_name: ict-studio-be
+    ports:
+      - "8000:8000"
+    environment:
+      APP_ENV: local
+      APP_PORT: 8000
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_DB: 0
+      REDIS_PASSWORD: ""
+    depends_on:
+      redis:
+        condition: service_started
+
+  redis:
+    image: redis:7-alpine
+    container_name: redis-queue
+    ports:
+      - "6379:6379"

@@ -1,4 +1,5 @@
 import os
+from functools import lru_cache
 from datetime import datetime, timezone
 from typing import Annotated, Literal
 from uuid import uuid4
@@ -7,6 +8,8 @@ from fastapi import Depends, FastAPI, HTTPException, Path, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, EmailStr, Field
+from redis import Redis
+from redis.exceptions import RedisError
 
 app = FastAPI(
     title="ICT Studio API",
@@ -167,6 +170,72 @@ class ErrorResponse(BaseModel):
     detail: str
 
 
+class QueueJoinRequest(BaseModel):
+    concertId: int | str = Field(..., examples=[1])
+    userId: str = Field(..., min_length=1, examples=["user-1"])
+
+
+class QueueJoinResponse(BaseModel):
+    status: Literal["WAITING"]
+    queueNumber: int = Field(..., examples=[152])
+    message: str
+
+
+class QueueStatusResponse(BaseModel):
+    concertId: int | str = Field(..., examples=[1])
+    userId: str = Field(..., examples=["user-1"])
+    status: Literal["WAITING", "NOT_FOUND"]
+    position: int | None = Field(None, examples=[32])
+    queueLength: int
+
+
+class QueueLengthResponse(BaseModel):
+    concertId: int | str = Field(..., examples=[1])
+    queueLength: int
+
+
+class CreateReservationRequest(BaseModel):
+    concertId: int | str = Field(..., examples=[1])
+    userId: str = Field(..., min_length=1, examples=["user-1"])
+    seatId: str = Field(..., min_length=1, examples=["A-10"])
+
+
+class ReservationCreatedResponse(BaseModel):
+    status: Literal["RESERVED"]
+    reservationId: int
+
+
+reservations: dict[int, dict] = {}
+reservation_counter = 1000
+
+
+@lru_cache
+def get_redis_client() -> Redis:
+    redis_password = os.getenv("REDIS_PASSWORD") or None
+    return Redis(
+        host=os.getenv("REDIS_HOST", "localhost"),
+        port=int(os.getenv("REDIS_PORT", "6379")),
+        db=int(os.getenv("REDIS_DB", "0")),
+        password=redis_password,
+        decode_responses=True,
+        socket_connect_timeout=float(os.getenv("REDIS_CONNECT_TIMEOUT", "2")),
+        socket_timeout=float(os.getenv("REDIS_SOCKET_TIMEOUT", "2")),
+    )
+
+
+def _queue_key(concert_id: int | str) -> str:
+    return f"queue:concert:{concert_id}"
+
+
+def _redis_or_503() -> Redis:
+    client = get_redis_client()
+    try:
+        client.ping()
+    except RedisError as exc:
+        raise HTTPException(status_code=503, detail="Redis queue is unavailable") from exc
+    return client
+
+
 # --- 인증 헬퍼 ---
 
 def get_current_user(
@@ -197,6 +266,101 @@ def _utc_now_iso() -> str:
 @app.get("/api/health", tags=["시스템"], summary="애플리케이션 헬스체크")
 def health_check():
     return {"status": "ok"}
+
+
+# --- Queue / load-test API ---
+
+@app.post(
+    "/api/queue/join",
+    response_model=QueueJoinResponse,
+    tags=["Queue"],
+    summary="Join Redis-backed waiting queue",
+    responses={503: {"model": ErrorResponse, "description": "Redis unavailable"}},
+)
+def join_queue(body: QueueJoinRequest):
+    redis_client = _redis_or_503()
+    key = _queue_key(body.concertId)
+
+    try:
+        waiting_users = redis_client.lrange(key, 0, -1)
+        if body.userId in waiting_users:
+            queue_number = waiting_users.index(body.userId) + 1
+        else:
+            queue_number = redis_client.rpush(key, body.userId)
+    except RedisError as exc:
+        raise HTTPException(status_code=503, detail="Failed to update Redis queue") from exc
+
+    return QueueJoinResponse(
+        status="WAITING",
+        queueNumber=queue_number,
+        message="Queue registration completed.",
+    )
+
+
+@app.get(
+    "/api/queue/status/{concert_id}/{user_id}",
+    response_model=QueueStatusResponse,
+    tags=["Queue"],
+    summary="Get queue status for a user",
+    responses={503: {"model": ErrorResponse, "description": "Redis unavailable"}},
+)
+def get_queue_status(concert_id: str, user_id: str):
+    redis_client = _redis_or_503()
+    key = _queue_key(concert_id)
+
+    try:
+        waiting_users = redis_client.lrange(key, 0, -1)
+    except RedisError as exc:
+        raise HTTPException(status_code=503, detail="Failed to read Redis queue") from exc
+
+    position = waiting_users.index(user_id) + 1 if user_id in waiting_users else None
+    return QueueStatusResponse(
+        concertId=concert_id,
+        userId=user_id,
+        status="WAITING" if position else "NOT_FOUND",
+        position=position,
+        queueLength=len(waiting_users),
+    )
+
+
+@app.get(
+    "/api/queue/length/{concert_id}",
+    response_model=QueueLengthResponse,
+    tags=["Queue"],
+    summary="Get queue length",
+    responses={503: {"model": ErrorResponse, "description": "Redis unavailable"}},
+)
+def get_queue_length(concert_id: str):
+    redis_client = _redis_or_503()
+    key = _queue_key(concert_id)
+
+    try:
+        length = redis_client.llen(key)
+    except RedisError as exc:
+        raise HTTPException(status_code=503, detail="Failed to read Redis queue") from exc
+
+    return QueueLengthResponse(concertId=concert_id, queueLength=length)
+
+
+@app.post(
+    "/api/reservations",
+    response_model=ReservationCreatedResponse,
+    tags=["Reservations"],
+    summary="Create a lightweight reservation for load testing",
+)
+def create_reservation(body: CreateReservationRequest):
+    global reservation_counter
+
+    reservation_counter += 1
+    reservations[reservation_counter] = {
+        "reservationId": reservation_counter,
+        "concertId": body.concertId,
+        "userId": body.userId,
+        "seatId": body.seatId,
+        "createdAt": _utc_now_iso(),
+    }
+
+    return ReservationCreatedResponse(status="RESERVED", reservationId=reservation_counter)
 
 
 # --- 인증 API ---
