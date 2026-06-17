@@ -250,7 +250,7 @@ def _queue_key(concert_id: int | str) -> str:
 
 
 def _queue_seq_key(concert_id: int | str) -> str:
-    return f"{_queue_key(concert_id)}:seq"
+    return f"queue:concert:{concert_id}:seq"
 
 
 @app.get("/api/health/redis", tags=["시스템"], summary="Redis 헬스체크")
