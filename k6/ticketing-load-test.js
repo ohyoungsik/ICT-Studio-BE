@@ -1,8 +1,9 @@
 import http from 'k6/http';
 import { check, sleep } from 'k6';
-import { Counter } from 'k6/metrics';
+import { Counter, Rate } from 'k6/metrics';
 
 const statusCodes = new Counter('status_codes');
+const serverErrors = new Rate('server_errors');
 
 export const options = {
   stages: [
@@ -12,8 +13,9 @@ export const options = {
     { duration: '2m', target: 0 },
   ],
   thresholds: {
-    http_req_failed: ['rate<0.05'],
     http_req_duration: ['p(95)<2000'],
+    checks: ['rate>0.99'],
+    server_errors: ['rate<0.01'],
   },
 };
 
@@ -33,6 +35,7 @@ export default function () {
 
   const res = http.post(`${baseUrl}/api/queue/join`, payload, params);
   statusCodes.add(1, { status: String(res.status) });
+  serverErrors.add(res.status >= 500 || res.status === 0);
 
   check(res, {
     'queued accepted or full': (r) => r.status === 200 || r.status === 202 || r.status === 429,

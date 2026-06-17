@@ -215,12 +215,6 @@ local seq_key = KEYS[2]
 local user_id = ARGV[1]
 local max_size = tonumber(ARGV[2])
 
-local key_type = redis.call('TYPE', queue_key)['ok']
-if key_type ~= 'none' and key_type ~= 'zset' then
-  redis.call('DEL', queue_key)
-  redis.call('DEL', seq_key)
-end
-
 local existing_rank = redis.call('ZRANK', queue_key, user_id)
 if existing_rank then
   return {1, existing_rank + 1, redis.call('ZCARD', queue_key)}
@@ -252,7 +246,7 @@ def get_redis_client() -> Redis:
 
 
 def _queue_key(concert_id: int | str) -> str:
-    return f"queue:concert:{concert_id}"
+    return f"queue:concert:{concert_id}:zset"
 
 
 def _queue_seq_key(concert_id: int | str) -> str:

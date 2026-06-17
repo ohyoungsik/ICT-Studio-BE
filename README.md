@@ -75,7 +75,8 @@ k6 run -e BASE_URL=http://localhost:8000 k6/ticketing-load-test.js
 ```
 
 대기열은 Redis Sorted Set으로 저장되며 key 형식은
-`queue:concert:{concertId}`입니다.
+`queue:concert:{concertId}:zset`입니다. 기존 Redis List 테스트 key인
+`queue:concert:{concertId}`와 충돌하지 않도록 별도 key를 사용합니다.
 
 응답 상태 코드는 다음 기준으로 구분합니다.
 
