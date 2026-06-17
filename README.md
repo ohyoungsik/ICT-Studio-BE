@@ -58,6 +58,9 @@ MAX_QUEUE_SIZE
 
 ```text
 POST /api/queue/join
+POST /api/queue/process
+POST /api/queue/worker
+GET  /api/queue/length
 GET  /api/queue/status/{concertId}/{userId}
 GET  /api/queue/length/{concertId}
 POST /api/reservations
@@ -95,6 +98,7 @@ ZRANK queue:concert:{concertId}:zset {userId}
 ZCARD queue:concert:{concertId}:zset
 INCR  queue:concert:{concertId}:seq
 ZADD  queue:concert:{concertId}:zset {seq} {userId}
+ZPOPMIN queue:concert:{concertId}:zset {count}
 ```
 
 마이그레이션 기간에는 infra가 구버전 list key도 fallback으로 읽을 수 있습니다.
@@ -138,6 +142,15 @@ Redis 장애 시 503 반환
 
 `MAX_QUEUE_SIZE` 기본값은 `10000`입니다.
 
+`concertId`를 생략하면 기본 검증 큐인 `concertId=1`에 등록됩니다.
+따라서 Scale-Out 검증용 단순 요청은 아래처럼 보낼 수 있습니다.
+
+```bash
+curl -X POST http://localhost:8000/api/queue/join \
+  -H "Content-Type: application/json" \
+  -d '{"userId":"load-user-1"}'
+```
+
 ## Queue Status / Length
 
 `/api/queue/status/{concertId}/{userId}`는 전체 큐 조회 없이 Redis `ZRANK`와 `ZCARD`로
@@ -150,6 +163,57 @@ position = rank + 1 if rank is not None else None
 ```
 
 `/api/queue/length/{concertId}`는 Redis `ZCARD`로 큐 길이를 조회합니다.
+
+Scale-Out 검증에서 사용하는 기본 큐 길이는 `/api/queue/length`로도 조회할 수 있습니다.
+응답은 CloudWatch publisher나 부하 테스트 확인에 바로 쓰기 쉬운 단순 형태입니다.
+
+```json
+{
+  "queueLength": 8432
+}
+```
+
+기본 큐는 `DEFAULT_CONCERT_ID` 환경 변수로 바꿀 수 있으며, 기본값은 `1`입니다.
+
+## Queue Process / Worker
+
+Scale-In 검증을 위해 Redis Sorted Set에서 대기 사용자를 소비하는 API를 제공합니다.
+`/api/queue/process`와 `/api/queue/worker`는 같은 동작을 수행하며, `ZPOPMIN`으로 가장 먼저 등록된 사용자부터 제거합니다.
+
+```bash
+curl -X POST http://localhost:8000/api/queue/process \
+  -H "Content-Type: application/json" \
+  -d '{"concertId":1,"count":100}'
+```
+
+`concertId`를 생략하면 기본 검증 큐인 `concertId=1`을 소비합니다.
+
+```bash
+curl -X POST http://localhost:8000/api/queue/worker \
+  -H "Content-Type: application/json" \
+  -d '{"count":100}'
+```
+
+응답 예시:
+
+```json
+{
+  "status": "PROCESSED",
+  "concertId": 1,
+  "processedCount": 100,
+  "queueLength": 9900,
+  "users": [
+    {
+      "userId": "user-1",
+      "score": 1
+    }
+  ],
+  "message": "Queue users processed."
+}
+```
+
+대기열이 비어 있으면 `processedCount`는 `0`, `status`는 `EMPTY`로 반환됩니다.
+이 API 호출로 `ZCARD queue:concert:1:zset` 값이 감소하면 infra의 metric publisher가 낮아진 Queue Length를 CloudWatch에 발행하고, ASG Scale-In 정책을 검증할 수 있습니다.
 
 ## CloudWatch Metric 책임
 
@@ -187,6 +251,24 @@ ALB 대상 실행 예시:
 k6 run --vus 500 --duration 3m \
   -e BASE_URL=http://prod-ict-alb-469671516.ap-northeast-2.elb.amazonaws.com \
   k6/ticketing-load-test.js
+```
+
+Scale-In 검증용 Queue 소비 부하 테스트:
+
+```bash
+k6 run \
+  -e BASE_URL=http://localhost:8000 \
+  -e CONCERT_ID=1 \
+  -e PROCESS_COUNT=10 \
+  k6/queue-consume-test.js
+```
+
+단건 API 호출로 Queue를 줄이는 명령:
+
+```bash
+curl -X POST http://localhost:8000/api/queue/process \
+  -H "Content-Type: application/json" \
+  -d '{"concertId":1,"count":100}'
 ```
 
 대기열 초과 정책을 테스트할 때 `429`는 의도된 응답일 수 있습니다. 따라서 k6 check는
@@ -237,6 +319,29 @@ aws autoscaling describe-scaling-activities `
   --max-items 10
 ```
 
+Scale-In 검증용 Queue 소비:
+
+```powershell
+curl.exe -X POST http://prod-ict-alb-469671516.ap-northeast-2.elb.amazonaws.com/api/queue/process `
+  -H "Content-Type: application/json" `
+  -d "{\"concertId\":1,\"count\":100}"
+```
+
+Queue Length 감소 확인:
+
+```powershell
+curl.exe http://prod-ict-alb-469671516.ap-northeast-2.elb.amazonaws.com/api/queue/length
+```
+
+ASG scale-in 활동 확인:
+
+```powershell
+aws autoscaling describe-scaling-activities `
+  --auto-scaling-group-name prod-ict-app-asg `
+  --region ap-northeast-2 `
+  --max-items 10
+```
+
 성공 기준:
 
 ```text
@@ -245,6 +350,55 @@ k6 요청 증가
 -> CloudWatch ICT/Queue QueueLengthPerInstance 증가
 -> ASG desired capacity 증가
 -> 새 app instance InService
+```
+
+## Scale-Out 검증 결과
+
+Scale-Out 검증은 Redis Sorted Set 적재 흐름으로 완료했습니다.
+`/api/queue/join` 호출이 증가하면 `queue:concert:1:zset`의 `ZCARD` 값이 증가하고,
+infra의 CloudWatch metric publisher가 이 값을 기반으로 ASG Scale-Out을 검증합니다.
+
+검증된 흐름:
+
+```text
+k6 부하 발생
+-> POST /api/queue/join
+-> Redis Sorted Set queue length 증가
+-> QueueLength / QueueLengthPerInstance metric 증가
+-> ASG 1 instance에서 4 instance까지 Scale-Out
+```
+
+확인된 Queue Length:
+
+```text
+0 -> 10000
+```
+
+Scale-In 검증은 `/api/queue/process` 또는 `/api/queue/worker`로 Queue Length를 감소시킨 뒤 진행합니다.
+
+```text
+POST /api/queue/process
+-> Redis ZPOPMIN 수행
+-> Queue Length 감소
+-> QueueLength / QueueLengthPerInstance metric 감소
+-> ASG Scale-In 검증
+```
+
+인프라에서 자동 Queue consumer를 사용하는 경우에는 검증 단계에 따라 consumer를 켜고 끕니다.
+
+```text
+Scale-Out 검증 단계:
+enable_queue_consumer = false
+-> Queue가 자동 소비되지 않도록 유지
+-> k6 join 부하로 Queue Length를 10000까지 증가
+-> ASG Scale-Out 확인
+
+Scale-In 검증 단계:
+enable_queue_consumer = true
+또는 POST /api/queue/process 호출
+-> Queue Length 감소
+-> CloudWatch metric 감소
+-> ASG Scale-In 확인
 ```
 
 ## Docker

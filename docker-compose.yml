@@ -11,7 +11,8 @@ services:
       REDIS_PORT: 6379
       REDIS_DB: 0
       REDIS_PASSWORD: ""
-      MAX_QUEUE_SIZE: 10000
+      MAX_QUEUE_SIZE: 50000
+      DEFAULT_CONCERT_ID: 1
     depends_on:
       redis:
         condition: service_started
