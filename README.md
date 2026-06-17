@@ -23,33 +23,35 @@ uvicorn api:app --reload
 curl http://localhost:8000/health
 ```
 
-Expected response:
+예상 응답:
 
 ```json
 {"status":"ok"}
 ```
 
-## Queue and reservation load-test APIs
+## Redis 대기열 및 k6 부하 테스트 API
 
-Redis is required for queue APIs.
-PostgreSQL is not required by the current backend implementation. The
-`/api/reservations` endpoint is a lightweight in-memory endpoint for load-test
-response simulation, so data is not persisted after the backend process restarts.
+대기열 API는 Redis가 필요합니다.
+현재 백엔드는 PostgreSQL을 사용하지 않습니다. `/api/reservations`는 부하 테스트 중
+예약 완료 응답을 흉내내기 위한 인메모리 API이며, 백엔드 프로세스가 재시작되면
+데이터가 초기화됩니다.
 
 ```bash
 docker compose up --build
 ```
 
-In AWS, the infra project starts Redis on the swarm manager and passes these
-values into the backend container through SSM-backed bootstrap scripts:
+AWS 환경에서는 infra 프로젝트가 Swarm manager 노드에서 Redis를 실행하고,
+bootstrap script가 SSM Parameter Store의 값을 읽어 백엔드 컨테이너에 아래
+환경변수를 주입합니다.
 
 ```text
 REDIS_HOST
 REDIS_PORT
 REDIS_PASSWORD
+MAX_QUEUE_SIZE
 ```
 
-Available endpoints:
+제공 API:
 
 ```text
 POST /api/queue/join
@@ -58,7 +60,7 @@ GET  /api/queue/length/{concertId}
 POST /api/reservations
 ```
 
-Example queue request:
+대기열 등록 요청 예시:
 
 ```bash
 curl -X POST http://localhost:8000/api/queue/join \
@@ -66,15 +68,27 @@ curl -X POST http://localhost:8000/api/queue/join \
   -d '{"concertId":1,"userId":"user-1"}'
 ```
 
-Run the k6 queue load test:
+k6 대기열 부하 테스트 실행:
 
 ```bash
 k6 run -e BASE_URL=http://localhost:8000 k6/ticketing-load-test.js
 ```
 
+대기열은 Redis Sorted Set으로 저장되며 key 형식은
+`queue:concert:{concertId}`입니다.
+
+응답 상태 코드는 다음 기준으로 구분합니다.
+
+```text
+202: 신규 사용자가 대기열에 등록됨
+200: 이미 등록된 사용자가 기존 순번을 조회함
+429: MAX_QUEUE_SIZE를 초과하여 대기열 등록이 거절됨
+503: Redis 연결 또는 명령 처리 실패
+```
+
 ## Docker
 
-Build and run locally:
+로컬 Docker 이미지 빌드 및 실행:
 
 ```bash
 docker build -t ict-studio-be .
@@ -89,7 +103,7 @@ docker logs ict-studio-be
 docker rm -f ict-studio-be
 ```
 
-Pull and run the Docker Hub image:
+Docker Hub 이미지 pull 및 실행:
 
 ```bash
 docker pull ohyoungsik/ict-studio-be:latest
@@ -105,21 +119,21 @@ docker rm -f ict-studio-be
 
 ## CI/CD
 
-GitHub Actions builds and pushes these tags:
+GitHub Actions는 아래 태그로 Docker 이미지를 빌드하고 push합니다.
 
 ```text
 ohyoungsik/ict-studio-be:latest
 ohyoungsik/ict-studio-be:<github-sha>
 ```
 
-Required secrets:
+필수 secrets:
 
 ```text
 DOCKERHUB_USERNAME
 DOCKERHUB_TOKEN
 ```
 
-Optional deployment secrets or variables:
+선택 배포 secrets 또는 variables:
 
 ```text
 AWS_ACCESS_KEY_ID
@@ -128,4 +142,6 @@ AWS_REGION
 ASG_NAME
 ```
 
-If `ASG_NAME` is not set, the workflow only builds and pushes the Docker image. This keeps the backend pipeline usable while AWS ASG resources are not present.
+`ASG_NAME`이 설정되어 있지 않으면 workflow는 Docker 이미지 빌드와 push까지만
+수행합니다. 이 경우 AWS ASG 리소스가 없어도 백엔드 이미지 빌드 파이프라인은
+사용할 수 있습니다.

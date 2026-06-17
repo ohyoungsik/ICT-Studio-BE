@@ -1,5 +1,8 @@
 import http from 'k6/http';
 import { check, sleep } from 'k6';
+import { Counter } from 'k6/metrics';
+
+const statusCodes = new Counter('status_codes');
 
 export const options = {
   stages: [
@@ -29,9 +32,11 @@ export default function () {
   };
 
   const res = http.post(`${baseUrl}/api/queue/join`, payload, params);
+  statusCodes.add(1, { status: String(res.status) });
 
   check(res, {
-    'status is 200 or 202': (r) => r.status === 200 || r.status === 202,
+    'queued accepted or full': (r) => r.status === 200 || r.status === 202 || r.status === 429,
+    'no server error': (r) => r.status < 500,
   });
 
   sleep(1);

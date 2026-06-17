@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 from typing import Annotated, Literal
 from uuid import uuid4
 
-from fastapi import Depends, FastAPI, HTTPException, Path, Query
+from fastapi import Depends, FastAPI, HTTPException, Path, Query, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, EmailStr, Field
@@ -207,6 +207,34 @@ class ReservationCreatedResponse(BaseModel):
 
 reservations: dict[int, dict] = {}
 reservation_counter = 1000
+MAX_QUEUE_SIZE = int(os.getenv("MAX_QUEUE_SIZE", "10000"))
+
+JOIN_QUEUE_SCRIPT = """
+local queue_key = KEYS[1]
+local seq_key = KEYS[2]
+local user_id = ARGV[1]
+local max_size = tonumber(ARGV[2])
+
+local key_type = redis.call('TYPE', queue_key)['ok']
+if key_type ~= 'none' and key_type ~= 'zset' then
+  redis.call('DEL', queue_key)
+  redis.call('DEL', seq_key)
+end
+
+local existing_rank = redis.call('ZRANK', queue_key, user_id)
+if existing_rank then
+  return {1, existing_rank + 1, redis.call('ZCARD', queue_key)}
+end
+
+local current_size = redis.call('ZCARD', queue_key)
+if current_size >= max_size then
+  return {0, -1, current_size}
+end
+
+local seq = redis.call('INCR', seq_key)
+redis.call('ZADD', queue_key, seq, user_id)
+return {2, current_size + 1, current_size + 1}
+"""
 
 
 @lru_cache
@@ -227,13 +255,17 @@ def _queue_key(concert_id: int | str) -> str:
     return f"queue:concert:{concert_id}"
 
 
-def _redis_or_503() -> Redis:
-    client = get_redis_client()
+def _queue_seq_key(concert_id: int | str) -> str:
+    return f"{_queue_key(concert_id)}:seq"
+
+
+@app.get("/api/health/redis", tags=["시스템"], summary="Redis 헬스체크")
+def redis_health_check():
     try:
-        client.ping()
+        get_redis_client().ping()
     except RedisError as exc:
         raise HTTPException(status_code=503, detail="Redis queue is unavailable") from exc
-    return client
+    return {"status": "ok"}
 
 
 # --- 인증 헬퍼 ---
@@ -275,20 +307,44 @@ def health_check():
     response_model=QueueJoinResponse,
     tags=["Queue"],
     summary="Join Redis-backed waiting queue",
-    responses={503: {"model": ErrorResponse, "description": "Redis unavailable"}},
+    responses={
+        429: {"description": "Queue is full"},
+        503: {"model": ErrorResponse, "description": "Redis unavailable"},
+    },
 )
-def join_queue(body: QueueJoinRequest):
-    redis_client = _redis_or_503()
+def join_queue(body: QueueJoinRequest, response: Response):
+    redis_client = get_redis_client()
     key = _queue_key(body.concertId)
+    seq_key = _queue_seq_key(body.concertId)
 
     try:
-        waiting_users = redis_client.lrange(key, 0, -1)
-        if body.userId in waiting_users:
-            queue_number = waiting_users.index(body.userId) + 1
-        else:
-            queue_number = redis_client.rpush(key, body.userId)
+        result = redis_client.eval(
+            JOIN_QUEUE_SCRIPT,
+            2,
+            key,
+            seq_key,
+            body.userId,
+            MAX_QUEUE_SIZE,
+        )
     except RedisError as exc:
         raise HTTPException(status_code=503, detail="Failed to update Redis queue") from exc
+
+    result_code = int(result[0])
+    queue_number = int(result[1])
+    queue_length = int(result[2])
+
+    if result_code == 0:
+        raise HTTPException(
+            status_code=429,
+            detail={
+                "message": "Queue is full.",
+                "queueLength": queue_length,
+                "maxQueueSize": MAX_QUEUE_SIZE,
+            },
+        )
+
+    if result_code == 2:
+        response.status_code = 202
 
     return QueueJoinResponse(
         status="WAITING",
@@ -305,21 +361,22 @@ def join_queue(body: QueueJoinRequest):
     responses={503: {"model": ErrorResponse, "description": "Redis unavailable"}},
 )
 def get_queue_status(concert_id: str, user_id: str):
-    redis_client = _redis_or_503()
+    redis_client = get_redis_client()
     key = _queue_key(concert_id)
 
     try:
-        waiting_users = redis_client.lrange(key, 0, -1)
+        rank = redis_client.zrank(key, user_id)
+        queue_length = redis_client.zcard(key)
     except RedisError as exc:
         raise HTTPException(status_code=503, detail="Failed to read Redis queue") from exc
 
-    position = waiting_users.index(user_id) + 1 if user_id in waiting_users else None
+    position = rank + 1 if rank is not None else None
     return QueueStatusResponse(
         concertId=concert_id,
         userId=user_id,
         status="WAITING" if position else "NOT_FOUND",
         position=position,
-        queueLength=len(waiting_users),
+        queueLength=queue_length,
     )
 
 
@@ -331,11 +388,11 @@ def get_queue_status(concert_id: str, user_id: str):
     responses={503: {"model": ErrorResponse, "description": "Redis unavailable"}},
 )
 def get_queue_length(concert_id: str):
-    redis_client = _redis_or_503()
+    redis_client = get_redis_client()
     key = _queue_key(concert_id)
 
     try:
-        length = redis_client.llen(key)
+        length = redis_client.zcard(key)
     except RedisError as exc:
         raise HTTPException(status_code=503, detail="Failed to read Redis queue") from exc
 
