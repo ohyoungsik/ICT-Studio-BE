@@ -171,7 +171,7 @@ class ErrorResponse(BaseModel):
 
 
 class QueueJoinRequest(BaseModel):
-    concertId: int | str = Field(..., examples=[1])
+    concertId: int | str = Field(1, examples=[1])
     userId: str = Field(..., min_length=1, examples=["user-1"])
 
 
@@ -194,6 +194,29 @@ class QueueLengthResponse(BaseModel):
     queueLength: int
 
 
+class DefaultQueueLengthResponse(BaseModel):
+    queueLength: int
+
+
+class QueueProcessRequest(BaseModel):
+    concertId: int | str = Field(1, examples=[1])
+    count: int = Field(1, ge=1, le=1000, examples=[100])
+
+
+class ProcessedQueueItem(BaseModel):
+    userId: str = Field(..., examples=["user-1"])
+    score: float = Field(..., examples=[152])
+
+
+class QueueProcessResponse(BaseModel):
+    status: Literal["PROCESSED", "EMPTY"]
+    concertId: int | str = Field(..., examples=[1])
+    processedCount: int = Field(..., examples=[100])
+    queueLength: int = Field(..., examples=[9900])
+    users: list[ProcessedQueueItem]
+    message: str
+
+
 class CreateReservationRequest(BaseModel):
     concertId: int | str = Field(..., examples=[1])
     userId: str = Field(..., min_length=1, examples=["user-1"])
@@ -208,6 +231,7 @@ class ReservationCreatedResponse(BaseModel):
 reservations: dict[int, dict] = {}
 reservation_counter = 1000
 MAX_QUEUE_SIZE = int(os.getenv("MAX_QUEUE_SIZE", "10000"))
+DEFAULT_CONCERT_ID = os.getenv("DEFAULT_CONCERT_ID", "1")
 
 JOIN_QUEUE_SCRIPT = """
 local queue_key = KEYS[1]
@@ -251,6 +275,10 @@ def _queue_key(concert_id: int | str) -> str:
 
 def _queue_seq_key(concert_id: int | str) -> str:
     return f"queue:concert:{concert_id}:seq"
+
+
+def _default_queue_key() -> str:
+    return _queue_key(DEFAULT_CONCERT_ID)
 
 
 @app.get("/api/health/redis", tags=["시스템"], summary="Redis 헬스체크")
@@ -375,6 +403,24 @@ def get_queue_status(concert_id: str, user_id: str):
 
 
 @app.get(
+    "/api/queue/length",
+    response_model=DefaultQueueLengthResponse,
+    tags=["Queue"],
+    summary="Get default queue length",
+    responses={503: {"model": ErrorResponse, "description": "Redis unavailable"}},
+)
+def get_default_queue_length():
+    redis_client = get_redis_client()
+
+    try:
+        length = redis_client.zcard(_default_queue_key())
+    except RedisError as exc:
+        raise HTTPException(status_code=503, detail="Failed to read Redis queue") from exc
+
+    return DefaultQueueLengthResponse(queueLength=length)
+
+
+@app.get(
     "/api/queue/length/{concert_id}",
     response_model=QueueLengthResponse,
     tags=["Queue"],
@@ -391,6 +437,50 @@ def get_queue_length(concert_id: str):
         raise HTTPException(status_code=503, detail="Failed to read Redis queue") from exc
 
     return QueueLengthResponse(concertId=concert_id, queueLength=length)
+
+
+@app.post(
+    "/api/queue/process",
+    response_model=QueueProcessResponse,
+    tags=["Queue"],
+    summary="Consume users from Redis-backed waiting queue",
+    responses={503: {"model": ErrorResponse, "description": "Redis unavailable"}},
+)
+@app.post(
+    "/api/queue/worker",
+    response_model=QueueProcessResponse,
+    tags=["Queue"],
+    summary="Worker-compatible queue consume API",
+    responses={503: {"model": ErrorResponse, "description": "Redis unavailable"}},
+)
+def process_queue(body: QueueProcessRequest):
+    redis_client = get_redis_client()
+    key = _queue_key(body.concertId)
+
+    try:
+        popped = redis_client.zpopmin(key, body.count)
+        queue_length = redis_client.zcard(key)
+    except RedisError as exc:
+        raise HTTPException(status_code=503, detail="Failed to consume Redis queue") from exc
+
+    users = [
+        ProcessedQueueItem(userId=str(user_id), score=float(score))
+        for user_id, score in popped
+    ]
+    processed_count = len(users)
+
+    return QueueProcessResponse(
+        status="PROCESSED" if processed_count else "EMPTY",
+        concertId=body.concertId,
+        processedCount=processed_count,
+        queueLength=queue_length,
+        users=users,
+        message=(
+            "Queue users processed."
+            if processed_count
+            else "Queue is empty."
+        ),
+    )
 
 
 @app.post(
