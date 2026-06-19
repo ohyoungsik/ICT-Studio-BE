@@ -1,24 +1,63 @@
 import os
-from functools import lru_cache
+import re
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Annotated, Literal
 from uuid import uuid4
 
+import bcrypt
 from fastapi import Depends, FastAPI, HTTPException, Path, Query, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, EmailStr, Field
-from redis import Redis
-from redis.exceptions import RedisError
+
+from database import (
+    DEFAULT_SEAT_PRICE,
+    check_connection,
+    close_pool,
+    get_connection,
+    init_pool,
+    map_perform_status_to_api,
+    parse_seat_no,
+    seed_if_empty,
+)
+from redis_queue import (
+    DEFAULT_CONCERT_ID,
+    check_redis_connection,
+    consume_queue_admission,
+    ensure_booking_window,
+    get_concert_queue_length,
+    get_user_queue_status,
+    has_queue_admission,
+    is_queue_required,
+    join_waiting_queue,
+    process_waiting_queue,
+    require_queue_admission,
+)
+
+security = HTTPBearer(auto_error=False)
+
+sessions: dict[str, str] = {}
+
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    init_pool()
+    seed_if_empty()
+    yield
+    close_pool()
+
 
 app = FastAPI(
     title="ICT Studio API",
-    description="ICT Studio 공연 예매 서비스 API 명세 (더미 데이터 기반)",
-    version="0.1.0",
+    description="ICT Studio 공연 예매 서비스 API (PostgreSQL + Redis 대기열)",
+    version="0.3.0",
+    lifespan=lifespan,
     openapi_tags=[
         {"name": "인증", "description": "회원가입, 로그인, 로그아웃"},
         {"name": "공연", "description": "공연 목록 및 상세 조회"},
         {"name": "좌석", "description": "공연별 좌석 조회"},
+        {"name": "Queue", "description": "Redis 대기열 (예매 가능 시간)"},
         {"name": "예매", "description": "예매 생성 및 조회 (인증 필요)"},
     ],
 )
@@ -37,57 +76,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-security = HTTPBearer(auto_error=False)
-
-# --- 더미 데이터 ---
-
-DUMMY_CONCERTS = [
-    {
-        "id": "ict-concert-2026",
-        "title": "ICT Studio 2026 콘서트",
-        "artist": "ICT Orchestra",
-        "venue": "ICT 아레나",
-        "date": "2026-06-15T19:00:00+09:00",
-        "status": "OPEN",
-        "description": "ICT Studio의 첫 번째 공연입니다.",
-        "price": 50000,
-    },
-    {
-        "id": "ict-concert-2025",
-        "title": "ICT Studio 2025 콘서트",
-        "artist": "ICT Orchestra",
-        "venue": "ICT 아레나",
-        "date": "2025-12-20T19:00:00+09:00",
-        "status": "CLOSED",
-        "description": "지난 시즌 공연입니다.",
-        "price": 45000,
-    },
-]
-
-DUMMY_SEATS: dict[str, list[dict]] = {
-    "ict-concert-2026": [
-        {"id": "A1", "row": "A", "number": 1, "status": "AVAILABLE", "price": 50000},
-        {"id": "A2", "row": "A", "number": 2, "status": "AVAILABLE", "price": 50000},
-        {"id": "A3", "row": "A", "number": 3, "status": "AVAILABLE", "price": 50000},
-        {"id": "A4", "row": "A", "number": 4, "status": "BOOKED", "price": 50000},
-        {"id": "B1", "row": "B", "number": 1, "status": "AVAILABLE", "price": 45000},
-        {"id": "B2", "row": "B", "number": 2, "status": "AVAILABLE", "price": 45000},
-        {"id": "B3", "row": "B", "number": 3, "status": "BOOKED", "price": 45000},
-    ],
-    "ict-concert-2025": [
-        {"id": "A1", "row": "A", "number": 1, "status": "BOOKED", "price": 45000},
-        {"id": "A2", "row": "A", "number": 2, "status": "BOOKED", "price": 45000},
-    ],
-}
-
-# 인메모리 저장소 (DB 대체)
-users: dict[str, dict] = {}
-sessions: dict[str, str] = {}  # token -> user_id
-bookings: dict[str, dict] = {}
-booking_counter = 0
-
 
 # --- Request / Response 모델 ---
+
 
 class SignupRequest(BaseModel):
     name: str = Field(..., min_length=1, examples=["홍길동"])
@@ -101,7 +92,7 @@ class LoginRequest(BaseModel):
 
 
 class UserResponse(BaseModel):
-    id: str = Field(..., examples=["user-001"])
+    id: str = Field(..., examples=["1"])
     name: str = Field(..., examples=["홍길동"])
     email: str = Field(..., examples=["user@example.com"])
 
@@ -116,7 +107,7 @@ class MessageResponse(BaseModel):
 
 
 class ConcertResponse(BaseModel):
-    id: str = Field(..., examples=["ict-concert-2026"])
+    id: str = Field(..., examples=["1"])
     title: str
     artist: str
     venue: str
@@ -142,12 +133,12 @@ class SeatResponse(BaseModel):
 
 
 class SeatListResponse(BaseModel):
-    concertId: str = Field(..., examples=["ict-concert-2026"])
+    concertId: str = Field(..., examples=["1"])
     seats: list[SeatResponse]
 
 
 class CreateBookingRequest(BaseModel):
-    concertId: str = Field(..., examples=["ict-concert-2026"])
+    concertId: str = Field(..., examples=["1"])
     seatIds: list[str] = Field(..., min_length=1, examples=[["A2", "A3"]])
 
 
@@ -171,8 +162,8 @@ class ErrorResponse(BaseModel):
 
 
 class QueueJoinRequest(BaseModel):
-    concertId: int | str = Field(1, examples=[1])
-    userId: str = Field(..., min_length=1, examples=["user-1"])
+    concertId: str = Field(..., examples=["1"])
+    userId: str | None = Field(None, examples=["1"])
 
 
 class QueueJoinResponse(BaseModel):
@@ -182,15 +173,15 @@ class QueueJoinResponse(BaseModel):
 
 
 class QueueStatusResponse(BaseModel):
-    concertId: int | str = Field(..., examples=[1])
-    userId: str = Field(..., examples=["user-1"])
-    status: Literal["WAITING", "NOT_FOUND"]
+    concertId: str = Field(..., examples=["1"])
+    userId: str = Field(..., examples=["1"])
+    status: Literal["WAITING", "NOT_FOUND", "ADMITTED"]
     position: int | None = Field(None, examples=[32])
     queueLength: int
 
 
 class QueueLengthResponse(BaseModel):
-    concertId: int | str = Field(..., examples=[1])
+    concertId: str = Field(..., examples=["1"])
     queueLength: int
 
 
@@ -199,98 +190,86 @@ class DefaultQueueLengthResponse(BaseModel):
 
 
 class QueueProcessRequest(BaseModel):
-    concertId: int | str = Field(1, examples=[1])
+    concertId: str = Field(..., examples=["1"])
     count: int = Field(1, ge=1, le=1000, examples=[100])
 
 
 class ProcessedQueueItem(BaseModel):
-    userId: str = Field(..., examples=["user-1"])
+    userId: str = Field(..., examples=["1"])
     score: float = Field(..., examples=[152])
 
 
 class QueueProcessResponse(BaseModel):
     status: Literal["PROCESSED", "EMPTY"]
-    concertId: int | str = Field(..., examples=[1])
+    concertId: str = Field(..., examples=["1"])
     processedCount: int = Field(..., examples=[100])
     queueLength: int = Field(..., examples=[9900])
     users: list[ProcessedQueueItem]
     message: str
 
 
-class CreateReservationRequest(BaseModel):
-    concertId: int | str = Field(..., examples=[1])
-    userId: str = Field(..., min_length=1, examples=["user-1"])
-    seatId: str = Field(..., min_length=1, examples=["A-10"])
+# --- 헬퍼 ---
 
 
-class ReservationCreatedResponse(BaseModel):
-    status: Literal["RESERVED"]
-    reservationId: int
+def hash_password(password: str) -> str:
+    return bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
 
 
-reservations: dict[int, dict] = {}
-reservation_counter = 1000
-MAX_QUEUE_SIZE = int(os.getenv("MAX_QUEUE_SIZE", "10000"))
-DEFAULT_CONCERT_ID = os.getenv("DEFAULT_CONCERT_ID", "1")
-
-JOIN_QUEUE_SCRIPT = """
-local queue_key = KEYS[1]
-local seq_key = KEYS[2]
-local user_id = ARGV[1]
-local max_size = tonumber(ARGV[2])
-
-local existing_rank = redis.call('ZRANK', queue_key, user_id)
-if existing_rank then
-  return {1, existing_rank + 1, redis.call('ZCARD', queue_key)}
-end
-
-local current_size = redis.call('ZCARD', queue_key)
-if current_size >= max_size then
-  return {0, -1, current_size}
-end
-
-local seq = redis.call('INCR', seq_key)
-redis.call('ZADD', queue_key, seq, user_id)
-return {2, current_size + 1, current_size + 1}
-"""
+def verify_password(password: str, password_hash: str) -> bool:
+    return bcrypt.checkpw(password.encode(), password_hash.encode())
 
 
-@lru_cache
-def get_redis_client() -> Redis:
-    redis_password = os.getenv("REDIS_PASSWORD") or None
-    return Redis(
-        host=os.getenv("REDIS_HOST", "localhost"),
-        port=int(os.getenv("REDIS_PORT", "6379")),
-        db=int(os.getenv("REDIS_DB", "0")),
-        password=redis_password,
-        decode_responses=True,
-        socket_connect_timeout=float(os.getenv("REDIS_CONNECT_TIMEOUT", "2")),
-        socket_timeout=float(os.getenv("REDIS_SOCKET_TIMEOUT", "2")),
+def parse_perform_id(concert_id: str) -> int:
+    if not re.fullmatch(r"\d+", concert_id):
+        raise HTTPException(status_code=404, detail="공연을 찾을 수 없습니다.")
+    return int(concert_id)
+
+
+def row_to_concert(row: dict) -> ConcertResponse:
+    return ConcertResponse(
+        id=str(row["perform_id"]),
+        title=row["perform_name"],
+        artist="ICT Orchestra",
+        venue="ICT 아레나",
+        date=row["booking_opens_at"].astimezone(timezone.utc).isoformat(),
+        status=map_perform_status_to_api(row["status"]),
+        description=f"{row['perform_name']} 공연입니다.",
+        price=DEFAULT_SEAT_PRICE,
     )
 
 
-def _queue_key(concert_id: int | str) -> str:
-    return f"queue:concert:{concert_id}:zset"
+def row_to_seat(row: dict) -> SeatResponse:
+    row_label, number = parse_seat_no(row["seat_no"])
+    return SeatResponse(
+        id=row["seat_no"],
+        row=row_label,
+        number=number,
+        status=row["status"],
+        price=DEFAULT_SEAT_PRICE,
+    )
 
 
-def _queue_seq_key(concert_id: int | str) -> str:
-    return f"queue:concert:{concert_id}:seq"
+def booking_group_key(row: dict) -> tuple:
+    booked_at = row["booked_at"]
+    if isinstance(booked_at, datetime):
+        booked_at = booked_at.replace(microsecond=0)
+    return (row["user_id"], row["perform_id"], booked_at)
 
 
-def _default_queue_key() -> str:
-    return _queue_key(DEFAULT_CONCERT_ID)
+def rows_to_booking(group_rows: list[dict]) -> BookingResponse:
+    first = group_rows[0]
+    seat_ids = [row["seat_no"] for row in group_rows]
+    return BookingResponse(
+        id=f"booking-{first['booking_id']}",
+        userId=str(first["user_id"]),
+        concertId=str(first["perform_id"]),
+        concertTitle=first["perform_name"],
+        seatIds=seat_ids,
+        totalPrice=DEFAULT_SEAT_PRICE * len(seat_ids),
+        status="CONFIRMED",
+        createdAt=first["booked_at"].astimezone(timezone.utc).isoformat(),
+    )
 
-
-@app.get("/api/health/redis", tags=["시스템"], summary="Redis 헬스체크")
-def redis_health_check():
-    try:
-        get_redis_client().ping()
-    except RedisError as exc:
-        raise HTTPException(status_code=503, detail="Redis queue is unavailable") from exc
-    return {"status": "ok"}
-
-
-# --- 인증 헬퍼 ---
 
 def get_current_user(
     credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(security)] = None,
@@ -299,21 +278,54 @@ def get_current_user(
         raise HTTPException(status_code=401, detail="인증 토큰이 필요합니다.")
 
     user_id = sessions.get(credentials.credentials)
-    if not user_id or user_id not in users:
+    if not user_id:
         raise HTTPException(status_code=401, detail="유효하지 않은 토큰입니다.")
 
-    return users[user_id]
+    with get_connection() as conn:
+        user = conn.execute(
+            "SELECT user_id, name, email FROM users WHERE user_id = %s",
+            (int(user_id),),
+        ).fetchone()
+
+    if not user:
+        raise HTTPException(status_code=401, detail="유효하지 않은 토큰입니다.")
+
+    return {
+        "id": str(user["user_id"]),
+        "name": user["name"],
+        "email": user["email"],
+    }
 
 
-def _find_concert(concert_id: str) -> dict:
-    for concert in DUMMY_CONCERTS:
-        if concert["id"] == concert_id:
-            return concert
-    raise HTTPException(status_code=404, detail="공연을 찾을 수 없습니다.")
+def fetch_perform(conn, perform_id: int) -> dict:
+    row = conn.execute(
+        """
+        SELECT perform_id, perform_name, booking_opens_at, booking_closes_at,
+               max_tickets_per_user, status
+        FROM perform_info
+        WHERE perform_id = %s
+        """,
+        (perform_id,),
+    ).fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="공연을 찾을 수 없습니다.")
+    return row
 
 
-def _utc_now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+def resolve_queue_user_id(
+    body: QueueJoinRequest,
+    credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(security)] = None,
+) -> str:
+    if credentials:
+        user_id = sessions.get(credentials.credentials)
+        if user_id:
+            return user_id
+    if body.userId:
+        return body.userId
+    raise HTTPException(status_code=401, detail="인증 토큰 또는 userId가 필요합니다.")
+
+
+# --- 헬스체크 ---
 
 
 @app.get("/health", tags=["시스템"], summary="ALB 헬스체크")
@@ -322,56 +334,53 @@ def health_check():
     return {"status": "ok"}
 
 
-# --- Queue / load-test API ---
+@app.get("/api/health/db", tags=["시스템"], summary="DB 연결 헬스체크")
+def health_check_db():
+    if not check_connection():
+        raise HTTPException(status_code=503, detail="Database connection failed")
+    return {"status": "ok", "database": "connected"}
+
+
+@app.get("/api/health/redis", tags=["시스템"], summary="Redis 헬스체크")
+def health_check_redis():
+    if not check_redis_connection():
+        raise HTTPException(status_code=503, detail="Redis queue is unavailable")
+    return {"status": "ok", "redis": "connected"}
+
+
+# --- Queue API ---
+
 
 @app.post(
     "/api/queue/join",
     response_model=QueueJoinResponse,
     tags=["Queue"],
-    summary="Join Redis-backed waiting queue",
+    summary="Redis 대기열 입장",
     responses={
-        429: {"description": "Queue is full"},
+        400: {"model": ErrorResponse, "description": "예매 불가 시간"},
+        401: {"model": ErrorResponse, "description": "인증 또는 userId 필요"},
+        429: {"description": "대기열 만석"},
         503: {"model": ErrorResponse, "description": "Redis unavailable"},
     },
 )
-def join_queue(body: QueueJoinRequest, response: Response):
-    redis_client = get_redis_client()
-    key = _queue_key(body.concertId)
-    seq_key = _queue_seq_key(body.concertId)
+def join_queue(
+    body: QueueJoinRequest,
+    response: Response,
+    user_id: Annotated[str, Depends(resolve_queue_user_id)],
+):
+    perform_id = parse_perform_id(body.concertId)
+    with get_connection() as conn:
+        perform = fetch_perform(conn, perform_id)
+    ensure_booking_window(perform)
 
-    try:
-        result = redis_client.eval(
-            JOIN_QUEUE_SCRIPT,
-            2,
-            key,
-            seq_key,
-            body.userId,
-            MAX_QUEUE_SIZE,
-        )
-    except RedisError as exc:
-        raise HTTPException(status_code=503, detail="Failed to update Redis queue") from exc
-
-    result_code = int(result[0])
-    queue_number = int(result[1])
-    queue_length = int(result[2])
-
-    if result_code == 0:
-        raise HTTPException(
-            status_code=429,
-            detail={
-                "message": "Queue is full.",
-                "queueLength": queue_length,
-                "maxQueueSize": MAX_QUEUE_SIZE,
-            },
-        )
-
-    if result_code == 2:
+    queue_number, _queue_length, is_new = join_waiting_queue(body.concertId, user_id)
+    if is_new:
         response.status_code = 202
 
     return QueueJoinResponse(
         status="WAITING",
         queueNumber=queue_number,
-        message="Queue registration completed.",
+        message="대기열 등록이 완료되었습니다." if is_new else "이미 대기열에 등록되어 있습니다.",
     )
 
 
@@ -379,20 +388,22 @@ def join_queue(body: QueueJoinRequest, response: Response):
     "/api/queue/status/{concert_id}/{user_id}",
     response_model=QueueStatusResponse,
     tags=["Queue"],
-    summary="Get queue status for a user",
-    responses={503: {"model": ErrorResponse, "description": "Redis unavailable"}},
+    summary="대기열 순번 조회",
 )
-def get_queue_status(concert_id: str, user_id: str):
-    redis_client = get_redis_client()
-    key = _queue_key(concert_id)
+def get_queue_status(
+    concert_id: Annotated[str, Path(description="공연 ID")],
+    user_id: Annotated[str, Path(description="사용자 ID")],
+):
+    position, queue_length = get_user_queue_status(concert_id, user_id)
+    if has_queue_admission(concert_id, user_id):
+        return QueueStatusResponse(
+            concertId=concert_id,
+            userId=user_id,
+            status="ADMITTED",
+            position=position,
+            queueLength=queue_length,
+        )
 
-    try:
-        rank = redis_client.zrank(key, user_id)
-        queue_length = redis_client.zcard(key)
-    except RedisError as exc:
-        raise HTTPException(status_code=503, detail="Failed to read Redis queue") from exc
-
-    position = rank + 1 if rank is not None else None
     return QueueStatusResponse(
         concertId=concert_id,
         userId=user_id,
@@ -406,63 +417,41 @@ def get_queue_status(concert_id: str, user_id: str):
     "/api/queue/length",
     response_model=DefaultQueueLengthResponse,
     tags=["Queue"],
-    summary="Get default queue length",
-    responses={503: {"model": ErrorResponse, "description": "Redis unavailable"}},
+    summary="기본 대기열 길이 조회",
 )
 def get_default_queue_length():
-    redis_client = get_redis_client()
-
-    try:
-        length = redis_client.zcard(_default_queue_key())
-    except RedisError as exc:
-        raise HTTPException(status_code=503, detail="Failed to read Redis queue") from exc
-
-    return DefaultQueueLengthResponse(queueLength=length)
+    return DefaultQueueLengthResponse(
+        queueLength=get_concert_queue_length(DEFAULT_CONCERT_ID),
+    )
 
 
 @app.get(
     "/api/queue/length/{concert_id}",
     response_model=QueueLengthResponse,
     tags=["Queue"],
-    summary="Get queue length",
-    responses={503: {"model": ErrorResponse, "description": "Redis unavailable"}},
+    summary="공연별 대기열 길이 조회",
 )
-def get_queue_length(concert_id: str):
-    redis_client = get_redis_client()
-    key = _queue_key(concert_id)
-
-    try:
-        length = redis_client.zcard(key)
-    except RedisError as exc:
-        raise HTTPException(status_code=503, detail="Failed to read Redis queue") from exc
-
-    return QueueLengthResponse(concertId=concert_id, queueLength=length)
+def get_queue_length(concert_id: Annotated[str, Path(description="공연 ID")]):
+    return QueueLengthResponse(
+        concertId=concert_id,
+        queueLength=get_concert_queue_length(concert_id),
+    )
 
 
 @app.post(
     "/api/queue/process",
     response_model=QueueProcessResponse,
     tags=["Queue"],
-    summary="Consume users from Redis-backed waiting queue",
-    responses={503: {"model": ErrorResponse, "description": "Redis unavailable"}},
+    summary="대기열 사용자 입장 처리 (워커)",
 )
 @app.post(
     "/api/queue/worker",
     response_model=QueueProcessResponse,
     tags=["Queue"],
-    summary="Worker-compatible queue consume API",
-    responses={503: {"model": ErrorResponse, "description": "Redis unavailable"}},
+    summary="워커 호환 대기열 소비 API",
 )
 def process_queue(body: QueueProcessRequest):
-    redis_client = get_redis_client()
-    key = _queue_key(body.concertId)
-
-    try:
-        popped = redis_client.zpopmin(key, body.count)
-        queue_length = redis_client.zcard(key)
-    except RedisError as exc:
-        raise HTTPException(status_code=503, detail="Failed to consume Redis queue") from exc
-
+    popped, queue_length = process_waiting_queue(body.concertId, body.count)
     users = [
         ProcessedQueueItem(userId=str(user_id), score=float(score))
         for user_id, score in popped
@@ -475,59 +464,39 @@ def process_queue(body: QueueProcessRequest):
         processedCount=processed_count,
         queueLength=queue_length,
         users=users,
-        message=(
-            "Queue users processed."
-            if processed_count
-            else "Queue is empty."
-        ),
+        message="대기열 사용자 입장 처리 완료." if processed_count else "대기열이 비어 있습니다.",
     )
 
 
-@app.post(
-    "/api/reservations",
-    response_model=ReservationCreatedResponse,
-    tags=["Reservations"],
-    summary="Create a lightweight reservation for load testing",
-)
-def create_reservation(body: CreateReservationRequest):
-    global reservation_counter
-
-    reservation_counter += 1
-    reservations[reservation_counter] = {
-        "reservationId": reservation_counter,
-        "concertId": body.concertId,
-        "userId": body.userId,
-        "seatId": body.seatId,
-        "createdAt": _utc_now_iso(),
-    }
-
-    return ReservationCreatedResponse(status="RESERVED", reservationId=reservation_counter)
-
-
 # --- 인증 API ---
+
 
 @app.post(
     "/api/auth/signup",
     response_model=UserResponse,
     tags=["인증"],
     summary="회원가입",
-    responses={
-        409: {"model": ErrorResponse, "description": "이미 등록된 이메일"},
-    },
+    responses={409: {"model": ErrorResponse, "description": "이미 등록된 이메일"}},
 )
 def signup(body: SignupRequest):
-    """FE에서 비밀번호 일치 검증 후 `name`, `email`, `password`만 전송합니다."""
-    if any(u["email"] == body.email for u in users.values()):
-        raise HTTPException(status_code=409, detail="이미 등록된 이메일입니다.")
+    with get_connection() as conn:
+        existing = conn.execute(
+            "SELECT user_id FROM users WHERE email = %s",
+            (body.email,),
+        ).fetchone()
+        if existing:
+            raise HTTPException(status_code=409, detail="이미 등록된 이메일입니다.")
 
-    user_id = f"user-{uuid4().hex[:8]}"
-    users[user_id] = {
-        "id": user_id,
-        "name": body.name,
-        "email": body.email,
-        "password": body.password,
-    }
-    return UserResponse(id=user_id, name=body.name, email=body.email)
+        row = conn.execute(
+            """
+            INSERT INTO users (name, email, password)
+            VALUES (%s, %s, %s)
+            RETURNING user_id, name, email
+            """,
+            (body.name, body.email, hash_password(body.password)),
+        ).fetchone()
+
+    return UserResponse(id=str(row["user_id"]), name=row["name"], email=row["email"])
 
 
 @app.post(
@@ -535,24 +504,27 @@ def signup(body: SignupRequest):
     response_model=LoginResponse,
     tags=["인증"],
     summary="로그인",
-    responses={
-        401: {"model": ErrorResponse, "description": "이메일 또는 비밀번호 오류"},
-    },
+    responses={401: {"model": ErrorResponse, "description": "이메일 또는 비밀번호 오류"}},
 )
 def login(body: LoginRequest):
-    """로그인 성공 시 `token`을 반환합니다. 이후 API 호출 시 `Authorization: Bearer {token}` 헤더를 사용하세요."""
-    user = next(
-        (u for u in users.values() if u["email"] == body.email and u["password"] == body.password),
-        None,
-    )
-    if not user:
+    with get_connection() as conn:
+        user = conn.execute(
+            "SELECT user_id, name, email, password FROM users WHERE email = %s",
+            (body.email,),
+        ).fetchone()
+
+    if not user or not verify_password(body.password, user["password"]):
         raise HTTPException(status_code=401, detail="이메일 또는 비밀번호가 올바르지 않습니다.")
 
     token = f"token-{uuid4().hex}"
-    sessions[token] = user["id"]
+    sessions[token] = str(user["user_id"])
     return LoginResponse(
         token=token,
-        user=UserResponse(id=user["id"], name=user["name"], email=user["email"]),
+        user=UserResponse(
+            id=str(user["user_id"]),
+            name=user["name"],
+            email=user["email"],
+        ),
     )
 
 
@@ -561,12 +533,10 @@ def login(body: LoginRequest):
     response_model=MessageResponse,
     tags=["인증"],
     summary="로그아웃",
-    responses={
-        401: {"model": ErrorResponse, "description": "인증 필요"},
-    },
+    responses={401: {"model": ErrorResponse, "description": "인증 필요"}},
 )
 def logout(
-    current_user: Annotated[dict, Depends(get_current_user)],
+    _: Annotated[dict, Depends(get_current_user)],
     credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(security)] = None,
 ):
     if credentials:
@@ -575,6 +545,7 @@ def logout(
 
 
 # --- 공연 API ---
+
 
 @app.get(
     "/api/concerts",
@@ -587,19 +558,37 @@ def list_concerts(
     page: int = Query(1, ge=1, description="페이지 번호"),
     size: int = Query(10, ge=1, le=100, description="페이지 크기"),
 ):
-    result = DUMMY_CONCERTS
+    params: list = []
+    where_clause = ""
     if status:
-        result = [c for c in result if c["status"] == status.upper()]
+        db_status = "OPEN" if status.upper() == "OPEN" else None
+        if db_status:
+            where_clause = "WHERE status = %s"
+            params.append(db_status)
+        else:
+            where_clause = "WHERE status <> 'OPEN'"
 
-    start = (page - 1) * size
-    end = start + size
-    paginated = result[start:end]
+    with get_connection() as conn:
+        total = conn.execute(
+            f"SELECT COUNT(*) AS count FROM perform_info {where_clause}",
+            params,
+        ).fetchone()["count"]
+        rows = conn.execute(
+            f"""
+            SELECT perform_id, perform_name, booking_opens_at, booking_closes_at, status
+            FROM perform_info
+            {where_clause}
+            ORDER BY perform_id DESC
+            LIMIT %s OFFSET %s
+            """,
+            [*params, size, (page - 1) * size],
+        ).fetchall()
 
     return ConcertListResponse(
-        concerts=[ConcertResponse(**c) for c in paginated],
+        concerts=[row_to_concert(row) for row in rows],
         page=page,
         size=size,
-        total=len(result),
+        total=total,
     )
 
 
@@ -608,42 +597,54 @@ def list_concerts(
     response_model=ConcertResponse,
     tags=["공연"],
     summary="공연 상세 조회",
-    responses={
-        404: {"model": ErrorResponse, "description": "공연 없음"},
-    },
+    responses={404: {"model": ErrorResponse, "description": "공연 없음"}},
 )
 def get_concert(
-    concert_id: Annotated[str, Path(description="공연 ID", examples=["ict-concert-2026"])],
+    concert_id: Annotated[str, Path(description="공연 ID", examples=["1"])],
 ):
-    return ConcertResponse(**_find_concert(concert_id))
+    perform_id = parse_perform_id(concert_id)
+    with get_connection() as conn:
+        row = fetch_perform(conn, perform_id)
+    return row_to_concert(row)
 
 
 # --- 좌석 API ---
+
 
 @app.get(
     "/api/concerts/{concert_id}/seats",
     response_model=SeatListResponse,
     tags=["좌석"],
     summary="좌석 목록 조회",
-    responses={
-        404: {"model": ErrorResponse, "description": "공연 또는 좌석 정보 없음"},
-    },
+    responses={404: {"model": ErrorResponse, "description": "공연 또는 좌석 정보 없음"}},
 )
 def list_seats(
-    concert_id: Annotated[str, Path(description="공연 ID", examples=["ict-concert-2026"])],
+    concert_id: Annotated[str, Path(description="공연 ID", examples=["1"])],
 ):
-    _find_concert(concert_id)
-    seats = DUMMY_SEATS.get(concert_id)
-    if seats is None:
+    perform_id = parse_perform_id(concert_id)
+    with get_connection() as conn:
+        fetch_perform(conn, perform_id)
+        rows = conn.execute(
+            """
+            SELECT seat_id, seat_no, status
+            FROM seat_status
+            WHERE perform_id = %s
+            ORDER BY seat_no
+            """,
+            (perform_id,),
+        ).fetchall()
+
+    if not rows:
         raise HTTPException(status_code=404, detail="좌석 정보를 찾을 수 없습니다.")
 
     return SeatListResponse(
         concertId=concert_id,
-        seats=[SeatResponse(**s) for s in seats],
+        seats=[row_to_seat(row) for row in rows],
     )
 
 
 # --- 예매 API ---
+
 
 @app.post(
     "/api/bookings",
@@ -653,6 +654,7 @@ def list_seats(
     responses={
         400: {"model": ErrorResponse, "description": "예매 불가 공연"},
         401: {"model": ErrorResponse, "description": "인증 필요"},
+        403: {"model": ErrorResponse, "description": "대기열 입장 권한 없음"},
         404: {"model": ErrorResponse, "description": "좌석 없음"},
         409: {"model": ErrorResponse, "description": "이미 예매된 좌석"},
     },
@@ -661,43 +663,104 @@ def create_booking(
     body: CreateBookingRequest,
     current_user: Annotated[dict, Depends(get_current_user)],
 ):
-    """`concertId`와 `seatIds`를 전송하여 예매를 생성합니다."""
-    global booking_counter
+    perform_id = parse_perform_id(body.concertId)
+    user_id = int(current_user["id"])
 
-    concert = _find_concert(body.concertId)
-    if concert["status"] != "OPEN":
-        raise HTTPException(status_code=400, detail="예매가 불가능한 공연입니다.")
+    with get_connection() as conn:
+        perform = fetch_perform(conn, perform_id)
 
-    seats = DUMMY_SEATS.get(body.concertId, [])
-    seat_map = {s["id"]: s for s in seats}
+        if perform["status"] != "OPEN":
+            raise HTTPException(status_code=400, detail="예매가 불가능한 공연입니다.")
 
-    for seat_id in body.seatIds:
-        seat = seat_map.get(seat_id)
-        if not seat:
-            raise HTTPException(status_code=404, detail=f"좌석 '{seat_id}'을(를) 찾을 수 없습니다.")
-        if seat["status"] != "AVAILABLE":
-            raise HTTPException(status_code=409, detail=f"좌석 '{seat_id}'은(는) 이미 예매되었습니다.")
+        now = datetime.now(timezone.utc)
+        opens_at = perform["booking_opens_at"]
+        closes_at = perform["booking_closes_at"]
+        if opens_at.tzinfo is None:
+            opens_at = opens_at.replace(tzinfo=timezone.utc)
+        if closes_at.tzinfo is None:
+            closes_at = closes_at.replace(tzinfo=timezone.utc)
+        if not (opens_at <= now <= closes_at):
+            raise HTTPException(status_code=400, detail="예매 가능 시간이 아닙니다.")
 
-    for seat_id in body.seatIds:
-        seat_map[seat_id]["status"] = "BOOKED"
+        if is_queue_required(perform, now):
+            require_queue_admission(str(perform_id), str(user_id))
 
-    booking_counter += 1
-    booking_id = f"booking-{booking_counter:03d}"
-    total_price = sum(seat_map[sid]["price"] for sid in body.seatIds)
+        existing_count = conn.execute(
+            "SELECT COUNT(*) AS count FROM booking WHERE perform_id = %s AND user_id = %s",
+            (perform_id, user_id),
+        ).fetchone()["count"]
+        if existing_count + len(body.seatIds) > perform["max_tickets_per_user"]:
+            raise HTTPException(
+                status_code=400,
+                detail=f"최대 {perform['max_tickets_per_user']}매까지 예매할 수 있습니다.",
+            )
 
-    booking = {
-        "id": booking_id,
-        "userId": current_user["id"],
-        "concertId": body.concertId,
-        "concertTitle": concert["title"],
-        "seatIds": body.seatIds,
-        "totalPrice": total_price,
-        "status": "CONFIRMED",
-        "createdAt": _utc_now_iso(),
-    }
-    bookings[booking_id] = booking
+        try:
+            with conn.transaction():
+                seats = conn.execute(
+                    """
+                    SELECT seat_id, seat_no, status
+                    FROM seat_status
+                    WHERE perform_id = %s AND seat_no = ANY(%s)
+                    FOR UPDATE
+                    """,
+                    (perform_id, body.seatIds),
+                ).fetchall()
 
-    return BookingResponse(**booking)
+                seat_map = {row["seat_no"]: row for row in seats}
+                for seat_id in body.seatIds:
+                    seat = seat_map.get(seat_id)
+                    if not seat:
+                        raise HTTPException(
+                            status_code=404,
+                            detail=f"좌석 '{seat_id}'을(를) 찾을 수 없습니다.",
+                        )
+                    if seat["status"] != "AVAILABLE":
+                        raise HTTPException(
+                            status_code=409,
+                            detail=f"좌석 '{seat_id}'은(는) 이미 예매되었습니다.",
+                        )
+
+                booking_ids: list[int] = []
+                for seat_id in body.seatIds:
+                    seat = seat_map[seat_id]
+                    booking_row = conn.execute(
+                        """
+                        INSERT INTO booking (perform_id, user_id, seat_id)
+                        VALUES (%s, %s, %s)
+                        RETURNING booking_id, booked_at
+                        """,
+                        (perform_id, user_id, seat["seat_id"]),
+                    ).fetchone()
+                    booking_ids.append(booking_row["booking_id"])
+                    conn.execute(
+                        "UPDATE seat_status SET status = 'BOOKED' WHERE seat_id = %s",
+                        (seat["seat_id"],),
+                    )
+        except HTTPException:
+            raise
+        except Exception as exc:
+            if getattr(exc, "sqlstate", None) == "23505":
+                raise HTTPException(status_code=409, detail="이미 예매된 좌석이 있습니다.") from exc
+            raise
+
+        group_rows = conn.execute(
+            """
+            SELECT b.booking_id, b.user_id, b.perform_id, b.booked_at,
+                   p.perform_name, s.seat_no
+            FROM booking b
+            JOIN perform_info p ON p.perform_id = b.perform_id
+            JOIN seat_status s ON s.seat_id = b.seat_id
+            WHERE b.booking_id = ANY(%s)
+            ORDER BY s.seat_no
+            """,
+            (booking_ids,),
+        ).fetchall()
+
+    if is_queue_required(perform, now):
+        consume_queue_admission(str(perform_id), str(user_id))
+
+    return rows_to_booking(group_rows)
 
 
 @app.get(
@@ -705,14 +768,32 @@ def create_booking(
     response_model=BookingListResponse,
     tags=["예매"],
     summary="내 예매 내역 조회",
-    responses={
-        401: {"model": ErrorResponse, "description": "인증 필요"},
-    },
+    responses={401: {"model": ErrorResponse, "description": "인증 필요"}},
 )
 def list_my_bookings(current_user: Annotated[dict, Depends(get_current_user)]):
-    my_bookings = [b for b in bookings.values() if b["userId"] == current_user["id"]]
-    my_bookings.sort(key=lambda b: b["createdAt"], reverse=True)
-    return BookingListResponse(bookings=[BookingResponse(**b) for b in my_bookings])
+    user_id = int(current_user["id"])
+    with get_connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT b.booking_id, b.user_id, b.perform_id, b.booked_at,
+                   p.perform_name, s.seat_no
+            FROM booking b
+            JOIN perform_info p ON p.perform_id = b.perform_id
+            JOIN seat_status s ON s.seat_id = b.seat_id
+            WHERE b.user_id = %s
+            ORDER BY b.booked_at DESC, b.booking_id DESC
+            """,
+            (user_id,),
+        ).fetchall()
+
+    grouped: dict[tuple, list[dict]] = {}
+    for row in rows:
+        key = booking_group_key(row)
+        grouped.setdefault(key, []).append(row)
+
+    bookings = [rows_to_booking(group) for group in grouped.values()]
+    bookings.sort(key=lambda item: item.createdAt, reverse=True)
+    return BookingListResponse(bookings=bookings)
 
 
 @app.get(
@@ -730,10 +811,41 @@ def get_booking(
     booking_id: Annotated[str, Path(description="예매 ID", examples=["booking-001"])],
     current_user: Annotated[dict, Depends(get_current_user)],
 ):
-    booking = bookings.get(booking_id)
-    if not booking:
+    match = re.fullmatch(r"booking-(\d+)", booking_id)
+    if not match:
         raise HTTPException(status_code=404, detail="예매 내역을 찾을 수 없습니다.")
-    if booking["userId"] != current_user["id"]:
-        raise HTTPException(status_code=403, detail="접근 권한이 없습니다.")
 
-    return BookingResponse(**booking)
+    primary_id = int(match.group(1))
+    user_id = int(current_user["id"])
+
+    with get_connection() as conn:
+        anchor = conn.execute(
+            """
+            SELECT b.booking_id, b.user_id, b.perform_id, b.booked_at
+            FROM booking b
+            WHERE b.booking_id = %s
+            """,
+            (primary_id,),
+        ).fetchone()
+        if not anchor:
+            raise HTTPException(status_code=404, detail="예매 내역을 찾을 수 없습니다.")
+        if anchor["user_id"] != user_id:
+            raise HTTPException(status_code=403, detail="접근 권한이 없습니다.")
+
+        booked_at = anchor["booked_at"].replace(microsecond=0)
+        rows = conn.execute(
+            """
+            SELECT b.booking_id, b.user_id, b.perform_id, b.booked_at,
+                   p.perform_name, s.seat_no
+            FROM booking b
+            JOIN perform_info p ON p.perform_id = b.perform_id
+            JOIN seat_status s ON s.seat_id = b.seat_id
+            WHERE b.user_id = %s
+              AND b.perform_id = %s
+              AND date_trunc('second', b.booked_at) = date_trunc('second', %s::timestamptz)
+            ORDER BY s.seat_no
+            """,
+            (anchor["user_id"], anchor["perform_id"], booked_at),
+        ).fetchall()
+
+    return rows_to_booking(rows)
