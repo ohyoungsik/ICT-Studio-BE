@@ -9,6 +9,7 @@ import bcrypt
 from fastapi import Depends, FastAPI, HTTPException, Path, Query, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from psycopg import OperationalError
 from pydantic import BaseModel, EmailStr, Field
 
 from database import (
@@ -19,6 +20,7 @@ from database import (
     init_pool,
     map_perform_status_to_api,
     parse_seat_no,
+    reset_pool,
     seed_if_empty,
 )
 from redis_queue import (
@@ -325,6 +327,29 @@ def resolve_queue_user_id(
     raise HTTPException(status_code=401, detail="인증 토큰 또는 userId가 필요합니다.")
 
 
+def run_db_once_with_retry(operation):
+    try:
+        with get_connection() as conn:
+            return operation(conn)
+    except OperationalError:
+        try:
+            reset_pool()
+        except Exception as reset_exc:
+            raise HTTPException(
+                status_code=503,
+                detail="Database connection is unavailable",
+            ) from reset_exc
+
+        try:
+            with get_connection() as conn:
+                return operation(conn)
+        except OperationalError as retry_exc:
+            raise HTTPException(
+                status_code=503,
+                detail="Database connection is unavailable",
+            ) from retry_exc
+
+
 # --- 헬스체크 ---
 
 
@@ -360,7 +385,7 @@ def health_check_redis():
         400: {"model": ErrorResponse, "description": "예매 불가 시간"},
         401: {"model": ErrorResponse, "description": "인증 또는 userId 필요"},
         429: {"description": "대기열 만석"},
-        503: {"model": ErrorResponse, "description": "Redis unavailable"},
+        503: {"model": ErrorResponse, "description": "Database or Redis unavailable"},
     },
 )
 def join_queue(
@@ -369,8 +394,7 @@ def join_queue(
     user_id: Annotated[str, Depends(resolve_queue_user_id)],
 ):
     perform_id = parse_perform_id(body.concertId)
-    with get_connection() as conn:
-        perform = fetch_perform(conn, perform_id)
+    perform = run_db_once_with_retry(lambda conn: fetch_perform(conn, perform_id))
     ensure_booking_window(perform)
 
     queue_number, _queue_length, is_new = join_waiting_queue(body.concertId, user_id)

@@ -1,6 +1,7 @@
 import os
 import re
 from contextlib import contextmanager
+from threading import Lock
 from typing import Any, Generator
 
 from psycopg.rows import dict_row
@@ -9,6 +10,7 @@ from psycopg_pool import ConnectionPool
 DEFAULT_SEAT_PRICE = 50_000
 
 _pool: ConnectionPool | None = None
+_pool_lock = Lock()
 
 
 def _build_conninfo() -> str:
@@ -26,10 +28,15 @@ def _build_conninfo() -> str:
 
 def init_pool() -> None:
     global _pool
-    if _pool is not None:
-        return
+    with _pool_lock:
+        if _pool is not None:
+            return
 
-    _pool = ConnectionPool(
+        _pool = _create_pool()
+
+
+def _create_pool() -> ConnectionPool:
+    return ConnectionPool(
         conninfo=_build_conninfo(),
         min_size=1,
         max_size=10,
@@ -40,17 +47,33 @@ def init_pool() -> None:
 
 def close_pool() -> None:
     global _pool
-    if _pool is not None:
-        _pool.close()
+    with _pool_lock:
+        pool = _pool
         _pool = None
+    if pool is not None:
+        pool.close()
+
+
+def reset_pool() -> None:
+    global _pool
+    with _pool_lock:
+        old_pool = _pool
+        _pool = _create_pool()
+
+    if old_pool is not None:
+        try:
+            old_pool.close()
+        except Exception:
+            pass
 
 
 @contextmanager
 def get_connection() -> Generator[Any, None, None]:
-    if _pool is None:
+    pool = _pool
+    if pool is None:
         raise RuntimeError("Database pool is not initialized")
 
-    with _pool.connection() as conn:
+    with pool.connection() as conn:
         yield conn
 
 
