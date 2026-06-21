@@ -25,16 +25,19 @@ from database import (
 )
 from redis_queue import (
     DEFAULT_CONCERT_ID,
+    QUEUE_DEMAND_THRESHOLD,
     check_redis_connection,
     consume_queue_admission,
     ensure_booking_window,
     get_concert_queue_length,
     get_user_queue_status,
+    grant_queue_admission,
     has_queue_admission,
-    is_queue_required,
     join_waiting_queue,
     process_waiting_queue,
+    register_booking_demand,
     require_queue_admission,
+    requires_queue_admission,
 )
 
 security = HTTPBearer(auto_error=False)
@@ -169,7 +172,7 @@ class QueueJoinRequest(BaseModel):
 
 
 class QueueJoinResponse(BaseModel):
-    status: Literal["WAITING"]
+    status: Literal["WAITING", "ADMITTED"]
     queueNumber: int = Field(..., examples=[152])
     message: str
 
@@ -396,6 +399,15 @@ def join_queue(
     perform_id = parse_perform_id(body.concertId)
     perform = run_db_once_with_retry(lambda conn: fetch_perform(conn, perform_id))
     ensure_booking_window(perform)
+
+    demand = register_booking_demand(body.concertId, user_id)
+    if demand <= QUEUE_DEMAND_THRESHOLD:
+        grant_queue_admission(body.concertId, user_id)
+        return QueueJoinResponse(
+            status="ADMITTED",
+            queueNumber=0,
+            message="현재 대기열 없이 바로 예매할 수 있습니다.",
+        )
 
     queue_number, _queue_length, is_new = join_waiting_queue(body.concertId, user_id)
     if is_new:
@@ -706,7 +718,7 @@ def create_booking(
         if not (opens_at <= now <= closes_at):
             raise HTTPException(status_code=400, detail="예매 가능 시간이 아닙니다.")
 
-        if is_queue_required(perform, now):
+        if requires_queue_admission(str(perform_id), str(user_id), perform, now):
             require_queue_admission(str(perform_id), str(user_id))
 
         existing_count = conn.execute(
@@ -781,7 +793,7 @@ def create_booking(
             (booking_ids,),
         ).fetchall()
 
-    if is_queue_required(perform, now):
+    if has_queue_admission(str(perform_id), str(user_id)):
         consume_queue_admission(str(perform_id), str(user_id))
 
     return rows_to_booking(group_rows)

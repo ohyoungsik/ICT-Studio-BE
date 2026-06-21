@@ -4,10 +4,15 @@ from contextlib import contextmanager
 from threading import Lock
 from typing import Any, Generator
 
+import bcrypt
 from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
 
 DEFAULT_SEAT_PRICE = 50_000
+SEED_USER_COUNT = int(os.getenv("SEED_USER_COUNT", "1100"))
+SEED_BOOKING_OPEN_DELAY_MINUTES = int(os.getenv("SEED_BOOKING_OPEN_DELAY_MINUTES", "10"))
+SEED_SEAT_COUNT = int(os.getenv("SEED_SEAT_COUNT", str(SEED_USER_COUNT)))
+SEED_USER_PASSWORD = os.getenv("SEED_USER_PASSWORD", "loadtest1234")
 
 _pool: ConnectionPool | None = None
 _pool_lock = Lock()
@@ -97,11 +102,26 @@ def map_perform_status_to_api(status: str) -> str:
     return "OPEN" if status == "OPEN" else "CLOSED"
 
 
+def _generate_seat_numbers(count: int) -> list[str]:
+    seats: list[str] = []
+    row_index = 0
+    while len(seats) < count:
+        row_label = chr(ord("A") + row_index)
+        for seat_num in range(1, 51):
+            seats.append(f"{row_label}{seat_num}")
+            if len(seats) >= count:
+                break
+        row_index += 1
+    return seats
+
+
 def seed_if_empty() -> None:
     with get_connection() as conn:
         count = conn.execute("SELECT COUNT(*) AS count FROM perform_info").fetchone()["count"]
         if count > 0:
             return
+
+        password_hash = bcrypt.hashpw(SEED_USER_PASSWORD.encode(), bcrypt.gensalt()).decode()
 
         with conn.transaction():
             row = conn.execute(
@@ -110,50 +130,42 @@ def seed_if_empty() -> None:
                     perform_name, booking_opens_at, booking_closes_at,
                     max_tickets_per_user, status
                 )
-                VALUES (%s, NOW() - INTERVAL '1 day', NOW() + INTERVAL '30 days', 4, 'OPEN')
+                VALUES (
+                    %s,
+                    NOW() + (%s * INTERVAL '1 minute'),
+                    NOW() + INTERVAL '7 days',
+                    1,
+                    'OPEN'
+                )
                 RETURNING perform_id
                 """,
-                ("ICT Studio 2026 콘서트",),
+                ("ICT Studio k6 Load Test Concert", SEED_BOOKING_OPEN_DELAY_MINUTES),
             ).fetchone()
-            open_perform_id = row["perform_id"]
+            perform_id = row["perform_id"]
 
-            conn.execute(
-                """
-                INSERT INTO perform_info (
-                    perform_name, booking_opens_at, booking_closes_at,
-                    max_tickets_per_user, status
-                )
-                VALUES (%s, NOW() - INTERVAL '365 days', NOW() - INTERVAL '1 day', 2, 'CLOSED')
-                """,
-                ("ICT Studio 2025 콘서트",),
-            )
-
-            open_seats = [
-                ("A1", "AVAILABLE"),
-                ("A2", "AVAILABLE"),
-                ("A3", "AVAILABLE"),
-                ("A4", "BOOKED"),
-                ("B1", "AVAILABLE"),
-                ("B2", "AVAILABLE"),
-                ("B3", "BOOKED"),
-            ]
-            for seat_no, status in open_seats:
-                conn.execute(
+            seat_numbers = _generate_seat_numbers(SEED_SEAT_COUNT)
+            with conn.cursor() as cur:
+                cur.executemany(
                     """
                     INSERT INTO seat_status (perform_id, seat_no, status)
+                    VALUES (%s, %s, 'AVAILABLE')
+                    """,
+                    [(perform_id, seat_no) for seat_no in seat_numbers],
+                )
+
+            user_rows = [
+                (
+                    f"Load Test User {user_id}",
+                    f"loadtest-user-{user_id}@example.com",
+                    password_hash,
+                )
+                for user_id in range(1, SEED_USER_COUNT + 1)
+            ]
+            with conn.cursor() as cur:
+                cur.executemany(
+                    """
+                    INSERT INTO users (name, email, password)
                     VALUES (%s, %s, %s)
                     """,
-                    (open_perform_id, seat_no, status),
-                )
-
-            closed_perform_id = conn.execute(
-                "SELECT perform_id FROM perform_info WHERE status = 'CLOSED' ORDER BY perform_id LIMIT 1"
-            ).fetchone()["perform_id"]
-            for seat_no in ("A1", "A2"):
-                conn.execute(
-                    """
-                    INSERT INTO seat_status (perform_id, seat_no, status)
-                    VALUES (%s, %s, 'BOOKED')
-                    """,
-                    (closed_perform_id, seat_no),
+                    user_rows,
                 )

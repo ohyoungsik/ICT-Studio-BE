@@ -7,6 +7,7 @@ from redis import Redis
 from redis.exceptions import RedisError
 
 MAX_QUEUE_SIZE = int(os.getenv("MAX_QUEUE_SIZE", "50000"))
+QUEUE_DEMAND_THRESHOLD = int(os.getenv("QUEUE_DEMAND_THRESHOLD", "500"))
 DEFAULT_CONCERT_ID = os.getenv("DEFAULT_CONCERT_ID", "1")
 QUEUE_ADMISSION_TTL_SECONDS = int(os.getenv("QUEUE_ADMISSION_TTL_SECONDS", "300"))
 
@@ -66,23 +67,72 @@ def admission_key(concert_id: int | str, user_id: str) -> str:
     return f"queue:admitted:{concert_id}:{user_id}"
 
 
+def demand_key(concert_id: int | str) -> str:
+    return f"queue:concert:{concert_id}:demand"
+
+
 def default_queue_key() -> str:
     return queue_key(DEFAULT_CONCERT_ID)
 
 
-def is_queue_required(perform: dict, now: datetime | None = None) -> bool:
-    """예매 가능 시간(OPEN)일 때만 Redis 대기열을 사용한다."""
-    if perform["status"] != "OPEN":
-        return False
-
-    now = now or datetime.now(timezone.utc)
+def _normalize_perform_window(perform: dict, now: datetime) -> tuple[datetime, datetime, datetime]:
     opens_at = perform["booking_opens_at"]
     closes_at = perform["booking_closes_at"]
     if opens_at.tzinfo is None:
         opens_at = opens_at.replace(tzinfo=timezone.utc)
     if closes_at.tzinfo is None:
         closes_at = closes_at.replace(tzinfo=timezone.utc)
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+    return now, opens_at, closes_at
+
+
+def is_booking_window_open(perform: dict, now: datetime | None = None) -> bool:
+    if perform["status"] != "OPEN":
+        return False
+
+    now = now or datetime.now(timezone.utc)
+    now, opens_at, closes_at = _normalize_perform_window(perform, now)
     return opens_at <= now <= closes_at
+
+
+def register_booking_demand(concert_id: int | str, user_id: str) -> int:
+    """예매 시도 사용자를 등록하고 현재 수요(고유 사용자 수)를 반환한다."""
+    client = get_redis_client()
+    key = demand_key(concert_id)
+    try:
+        client.sadd(key, str(user_id))
+        return int(client.scard(key))
+    except RedisError as exc:
+        raise HTTPException(status_code=503, detail="Failed to update booking demand") from exc
+
+
+def get_booking_demand_count(concert_id: int | str) -> int:
+    try:
+        return int(get_redis_client().scard(demand_key(concert_id)))
+    except RedisError as exc:
+        raise HTTPException(status_code=503, detail="Failed to read booking demand") from exc
+
+
+def requires_queue_admission(
+    concert_id: int | str,
+    user_id: str,
+    perform: dict,
+    now: datetime | None = None,
+) -> bool:
+    """오픈 시간 이후 예매 시도 사용자가 임계값(기본 500)을 초과하면 대기열 입장 권한이 필요하다."""
+    if not is_booking_window_open(perform, now):
+        return False
+
+    demand = register_booking_demand(concert_id, user_id)
+    return demand > QUEUE_DEMAND_THRESHOLD
+
+
+def is_queue_required(perform: dict, now: datetime | None = None) -> bool:
+    """레거시 호환: 오픈 시간 중이며 현재 수요가 임계값을 초과했는지 조회한다."""
+    if not is_booking_window_open(perform, now):
+        return False
+    return get_booking_demand_count(perform["perform_id"]) > QUEUE_DEMAND_THRESHOLD
 
 
 def ensure_booking_window(perform: dict, now: datetime | None = None) -> None:
@@ -90,12 +140,7 @@ def ensure_booking_window(perform: dict, now: datetime | None = None) -> None:
     if perform["status"] != "OPEN":
         raise HTTPException(status_code=400, detail="예매가 불가능한 공연입니다.")
 
-    opens_at = perform["booking_opens_at"]
-    closes_at = perform["booking_closes_at"]
-    if opens_at.tzinfo is None:
-        opens_at = opens_at.replace(tzinfo=timezone.utc)
-    if closes_at.tzinfo is None:
-        closes_at = closes_at.replace(tzinfo=timezone.utc)
+    now, opens_at, closes_at = _normalize_perform_window(perform, now)
     if not (opens_at <= now <= closes_at):
         raise HTTPException(status_code=400, detail="예매 가능 시간이 아닙니다.")
 
@@ -174,6 +219,17 @@ def process_waiting_queue(concert_id: int | str, count: int) -> tuple[list[tuple
         raise HTTPException(status_code=503, detail="Failed to consume Redis queue") from exc
 
     return popped, queue_length
+
+
+def grant_queue_admission(concert_id: int | str, user_id: str) -> None:
+    try:
+        get_redis_client().setex(
+            admission_key(concert_id, str(user_id)),
+            QUEUE_ADMISSION_TTL_SECONDS,
+            "1",
+        )
+    except RedisError as exc:
+        raise HTTPException(status_code=503, detail="Failed to grant queue admission") from exc
 
 
 def has_queue_admission(concert_id: int | str, user_id: str) -> bool:
