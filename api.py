@@ -14,14 +14,15 @@ from pydantic import BaseModel, EmailStr, Field
 
 from database import (
     DEFAULT_SEAT_PRICE,
+    bootstrap_database,
     check_connection,
+    check_read_connection,
     close_pool,
     get_connection,
-    init_pool,
+    get_read_connection,
     map_perform_status_to_api,
     parse_seat_no,
     reset_pool,
-    seed_if_empty,
 )
 from redis_queue import (
     DEFAULT_CONCERT_ID,
@@ -47,8 +48,8 @@ sessions: dict[str, str] = {}
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    init_pool()
-    seed_if_empty()
+    # DB 서버 프로비저닝 대기 → 테이블 생성 → 더미 데이터 시드를 자동 수행한다.
+    bootstrap_database()
     yield
     close_pool()
 
@@ -286,7 +287,7 @@ def get_current_user(
     if not user_id:
         raise HTTPException(status_code=401, detail="유효하지 않은 토큰입니다.")
 
-    with get_connection() as conn:
+    with get_read_connection() as conn:
         user = conn.execute(
             "SELECT user_id, name, email FROM users WHERE user_id = %s",
             (int(user_id),),
@@ -330,9 +331,10 @@ def resolve_queue_user_id(
     raise HTTPException(status_code=401, detail="인증 토큰 또는 userId가 필요합니다.")
 
 
-def run_db_once_with_retry(operation):
+def run_db_once_with_retry(operation, *, readonly: bool = False):
+    connect = get_read_connection if readonly else get_connection
     try:
-        with get_connection() as conn:
+        with connect() as conn:
             return operation(conn)
     except OperationalError:
         try:
@@ -344,7 +346,7 @@ def run_db_once_with_retry(operation):
             ) from reset_exc
 
         try:
-            with get_connection() as conn:
+            with connect() as conn:
                 return operation(conn)
         except OperationalError as retry_exc:
             raise HTTPException(
@@ -367,6 +369,13 @@ def health_check_db():
     if not check_connection():
         raise HTTPException(status_code=503, detail="Database connection failed")
     return {"status": "ok", "database": "connected"}
+
+
+@app.get("/api/health/db/read", tags=["시스템"], summary="읽기 전용 DB(Replica) 헬스체크")
+def health_check_db_read():
+    if not check_read_connection():
+        raise HTTPException(status_code=503, detail="Read database connection failed")
+    return {"status": "ok", "database": "connected", "mode": "read"}
 
 
 @app.get("/api/health/redis", tags=["시스템"], summary="Redis 헬스체크")
@@ -397,7 +406,9 @@ def join_queue(
     user_id: Annotated[str, Depends(resolve_queue_user_id)],
 ):
     perform_id = parse_perform_id(body.concertId)
-    perform = run_db_once_with_retry(lambda conn: fetch_perform(conn, perform_id))
+    perform = run_db_once_with_retry(
+        lambda conn: fetch_perform(conn, perform_id), readonly=True
+    )
     ensure_booking_window(perform)
 
     demand = register_booking_demand(body.concertId, user_id)
@@ -543,7 +554,7 @@ def signup(body: SignupRequest):
     responses={401: {"model": ErrorResponse, "description": "이메일 또는 비밀번호 오류"}},
 )
 def login(body: LoginRequest):
-    with get_connection() as conn:
+    with get_read_connection() as conn:
         user = conn.execute(
             "SELECT user_id, name, email, password FROM users WHERE email = %s",
             (body.email,),
@@ -604,7 +615,7 @@ def list_concerts(
         else:
             where_clause = "WHERE status <> 'OPEN'"
 
-    with get_connection() as conn:
+    with get_read_connection() as conn:
         total = conn.execute(
             f"SELECT COUNT(*) AS count FROM perform_info {where_clause}",
             params,
@@ -639,7 +650,7 @@ def get_concert(
     concert_id: Annotated[str, Path(description="공연 ID", examples=["1"])],
 ):
     perform_id = parse_perform_id(concert_id)
-    with get_connection() as conn:
+    with get_read_connection() as conn:
         row = fetch_perform(conn, perform_id)
     return row_to_concert(row)
 
@@ -658,7 +669,7 @@ def list_seats(
     concert_id: Annotated[str, Path(description="공연 ID", examples=["1"])],
 ):
     perform_id = parse_perform_id(concert_id)
-    with get_connection() as conn:
+    with get_read_connection() as conn:
         fetch_perform(conn, perform_id)
         rows = conn.execute(
             """
@@ -808,7 +819,7 @@ def create_booking(
 )
 def list_my_bookings(current_user: Annotated[dict, Depends(get_current_user)]):
     user_id = int(current_user["id"])
-    with get_connection() as conn:
+    with get_read_connection() as conn:
         rows = conn.execute(
             """
             SELECT b.booking_id, b.user_id, b.perform_id, b.booked_at,
@@ -854,7 +865,7 @@ def get_booking(
     primary_id = int(match.group(1))
     user_id = int(current_user["id"])
 
-    with get_connection() as conn:
+    with get_read_connection() as conn:
         anchor = conn.execute(
             """
             SELECT b.booking_id, b.user_id, b.perform_id, b.booked_at

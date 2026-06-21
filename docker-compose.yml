@@ -13,12 +13,44 @@ services:
       REDIS_PASSWORD: ""
       MAX_QUEUE_SIZE: 50000
       DEFAULT_CONCERT_ID: 1
+      # DB 접속 정보 (postgres 서비스로 연결)
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_NAME: ticketing
+      DB_USER: appuser
+      DB_PASSWORD: app_password
+      # 더미 데이터 시드 설정 (k6 부하 테스트용)
+      SEED_USER_COUNT: 1100
+      SEED_BOOKING_OPEN_DELAY_MINUTES: 10
+      SEED_MAX_TICKETS_PER_USER: 1
     depends_on:
       redis:
         condition: service_started
+      postgres:
+        condition: service_healthy
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: ict-studio-db
+    environment:
+      POSTGRES_DB: ticketing
+      POSTGRES_USER: appuser
+      POSTGRES_PASSWORD: app_password
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U appuser -d ticketing"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
 
   redis:
     image: redis:7-alpine
     container_name: redis-queue
     ports:
       - "6379:6379"
+
+volumes:
+  postgres-data:
